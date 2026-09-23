@@ -1,0 +1,17 @@
+[package]
+name = "tufops-cloud"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+google-cloud-kms-v1.workspace = true
+google-cloud-storage.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+tuf.workspace = true
+tufops-core.workspace = true

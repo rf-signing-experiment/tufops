@@ -1,0 +1,72 @@
+name: tufops
+description: >-
+  Maintains a tufops TUF repository: tracks signing events in pull requests, merges fully signed
+  events, signs snapshot and timestamp online, and publishes to cloud storage.
+
+inputs:
+  app-client-id:
+    description: Client ID of the GitHub App tufops acts as.
+    required: true
+  app-private-key:
+    description: Private key of the GitHub App.
+    required: true
+  gcp-workload-identity-provider:
+    description: >-
+      Workload Identity Federation provider, as
+      projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER.
+    required: true
+  gcp-service-account:
+    description: Service account that signs with Cloud KMS and writes to Cloud Storage.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - id: app
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ steps.app.outputs.token }}
+        fetch-depth: 0
+
+    # Only main needs Google Cloud; signing event branches just talk to GitHub.
+    - if: github.ref_name == 'main'
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.gcp-workload-identity-provider }}
+        service_account: ${{ inputs.gcp-service-account }}
+
+    - id: download
+      name: Download tufops-ci
+      shell: bash
+      env:
+        # Set by the release process (see MANUAL.md): pinning this action pins the binary.
+        TUFOPS_REPO: OWNER/tufops
+        TUFOPS_VERSION: 0.1.0
+        TUFOPS_SHA256: 0000000000000000000000000000000000000000000000000000000000000000
+      run: |
+        url="https://github.com/$TUFOPS_REPO/releases/download/v$TUFOPS_VERSION/tufops-ci-x86_64-unknown-linux-gnu"
+        curl --fail --silent --show-error --location --output "$RUNNER_TEMP/tufops-ci" "$url"
+        echo "$TUFOPS_SHA256  $RUNNER_TEMP/tufops-ci" | sha256sum --check --strict
+        chmod +x "$RUNNER_TEMP/tufops-ci"
+
+    - name: Run tufops
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+        GIT_AUTHOR_NAME: ${{ steps.app.outputs.app-slug }}[bot]
+        GIT_AUTHOR_EMAIL: ${{ steps.app.outputs.app-slug }}[bot]@users.noreply.github.com
+        GIT_COMMITTER_NAME: ${{ steps.app.outputs.app-slug }}[bot]
+        GIT_COMMITTER_EMAIL: ${{ steps.app.outputs.app-slug }}[bot]@users.noreply.github.com
+      run: '"$RUNNER_TEMP/tufops-ci" run'
+
+    - name: Report failure
+      if: failure() && steps.download.outcome == 'success'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+      run: '"$RUNNER_TEMP/tufops-ci" report-failure'

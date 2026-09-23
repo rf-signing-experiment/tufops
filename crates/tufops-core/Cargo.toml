@@ -1,0 +1,18 @@
+[package]
+name = "tufops-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+md-5.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tuf.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

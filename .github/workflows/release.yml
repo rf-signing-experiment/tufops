@@ -1,0 +1,29 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install --yes libpcsclite-dev
+      - run: cargo build --release --locked -p tufops -p tufops-ci
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          for bin in tufops tufops-ci; do
+            cp "target/release/$bin" "dist/$bin-x86_64-unknown-linux-gnu"
+          done
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          gh release create "$TAG" --verify-tag --title "$TAG" dist/*
+          { echo '```'; cat dist/SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

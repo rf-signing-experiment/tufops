@@ -1,0 +1,23 @@
+[package]
+name = "tufops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "User CLI for managing a tufops TUF repository"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tuf.workspace = true
+tufops-cloud.workspace = true
+tufops-core.workspace = true
+walkdir.workspace = true
+x509-cert.workspace = true
+yubikey.workspace = true
+zeroize.workspace = true

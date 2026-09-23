@@ -1,0 +1,15 @@
+[package]
+name = "tufops-ci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GitHub Actions entry point for a tufops TUF repository"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+octocrab.workspace = true
+tokio.workspace = true
+tufops-cloud.workspace = true
+tufops-core.workspace = true

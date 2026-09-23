@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[workspace.dependencies]
+tufops-core = { path = "crates/tufops-core" }
+tufops-cloud = { path = "crates/tufops-cloud" }
+
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.12"
+futures-util = { version = "0.3", features = ["io"] }
+google-cloud-kms-v1 = "1"
+google-cloud-storage = "1"
+md-5 = "0.10"
+# Use aws-lc for TLS like the Google Cloud crates: rustls needs a single crypto provider.
+octocrab = { version = "0.54", default-features = false, features = [
+    "default-client", "follow-redirect", "jwt-aws-lc-rs", "retry", "rustls", "rustls-aws-lc-rs", "timeout",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+toml = "1"
+tuf = { git = "https://github.com/rf-signing-experiment/rust-tuf.git", branch = "tbdsigning" }
+walkdir = "2"
+x509-cert = "0.2"
+yubikey = "0.8"
+zeroize = "1"
