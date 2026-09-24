@@ -9,9 +9,10 @@ style of [tuf-on-ci](https://github.com/theupdateframework/tuf-on-ci):
   storage (Google Cloud Storage for now).
 * **Offline keys** are YubiKeys held by people. **Online keys** are Cloud KMS keys, used by the
   `tufops` CLI and by CI.
-* A **GitHub action** tracks each signing event in a pull request that lists who still has to
-  sign. It merges the event into `main` once every signature is in, signs `snapshot` and
-  `timestamp`, and publishes `main` to cloud storage.
+* A **GitHub action** tracks each signing event that needs people in a pull request, which lists
+  who still has to sign. A maintainer merges it once every signature is in. Events that only
+  online keys sign are merged by CI straight away. On `main`, CI signs `snapshot` and
+  `timestamp` and publishes to cloud storage.
 
 Contents:
 
@@ -49,14 +50,18 @@ A signing event is a `sign/<name>` branch that changes metadata. It goes through
 
 1. Someone runs `tufops add` or `tufops apply`. The CLI makes the change, signs it with every
    online key it needs, and with your YubiKey if it needs yours. It then pushes the branch.
-2. CI works out whose signatures are still missing:
-   * If nothing is missing and only `metadata/` changed, CI merges the event into `main`.
-     Changes signed only by online keys therefore go live without a pull request.
-   * Otherwise CI opens a pull request and keeps its description up to date with who has signed
-     and who hasn't.
+2. CI works out what the event changes and whose signatures are still missing:
+   * If only online keys sign the event, all their signatures are in, and only `metadata/`
+     changed, CI merges it into `main`. Online-only changes therefore go live without a pull
+     request.
+   * Otherwise CI opens a pull request. Its description lists every change and who has and
+     hasn't signed, and CI keeps it up to date.
+   * Either way, CI sets a `tufops/signatures` status on the event's latest commit. It stays
+     pending until every signature is in, so as a required check it blocks merging (§3.2).
 3. Signers run `tufops sign` to add their signatures. Each push updates the pull request.
-4. When the last signature is in, CI merges the event. An event that also changes `tufops.toml`
-   needs a maintainer to review and merge it, because the config is not covered by signatures.
+4. When the last signature is in, the status turns green, and a maintainer reviews and merges
+   it. CI never merges an event that offline keys sign, or one that changes `tufops.toml`, which
+   signatures don't cover.
 5. On `main`, CI signs new `snapshot` and `timestamp` versions and publishes.
 
 ### What lives where
@@ -87,7 +92,7 @@ The `tufops` CLI needs `git` (it uses your normal git credentials) and, for Yubi
 service. On Debian/Ubuntu install `pcscd` and `libpcsclite-dev`. macOS already has PC/SC.
 
 ```sh
-cargo install --locked --git https://github.com/rf-signing-experiments/tufops tufops
+cargo install --locked --git https://github.com/rf-signing-experiment/tufops tufops
 ```
 
 Linux x86-64 binaries are also attached to each release.
@@ -160,6 +165,7 @@ able to push to a protected `main`.
    * **Repository permissions**:
      * Contents: **Read and write** (push metadata, merge events, delete event branches)
      * Pull requests: **Read and write** (open and update signing event pull requests)
+     * Commit statuses: **Read and write** (the `tufops/signatures` status)
      * Issues: **Read and write** (report failed runs)
      * Metadata: **Read-only** (required by GitHub)
      * Leave everything else at **No access**. In particular it does not need Workflows.
@@ -175,8 +181,13 @@ able to push to a protected `main`.
    * Variable `GCP_SERVICE_ACCOUNT`: `tufops-ci@<PROJECT>.iam.gserviceaccount.com`.
 5. Protect `main` under **Settings → Rules → Rulesets → New branch ruleset**:
    * Target: the default branch.
-   * Rules: **Restrict deletions**, **Block force pushes**, and **Require a pull request before
-     merging**.
+   * Rules: **Restrict deletions**, **Block force pushes**, **Require a pull request before
+     merging**, and **Require status checks to pass** with the check `tufops/signatures`. That
+     check is what stops a pull request from being merged while signatures are missing. The
+     workflow job itself succeeds whenever it did its work, even if signatures are missing.
+     Pull requests from branches other than `sign/*` never get the check, so metadata can
+     only reach `main` through signing events. Merge any other change (such as a workflow
+     update) with a bypass.
    * **Bypass list**: add the tufops App (**Always allow**), so CI can push `snapshot` and
      `timestamp` and merge signing events.
 
@@ -293,7 +304,7 @@ jobs:
   tufops:
     runs-on: ubuntu-latest
     steps:
-      - uses: rf-signing-experiment/tufops@<commit sha> # v0.1.0
+      - uses: rf-signing-experiment/tufops@b0cef4d026a80848cfb90b801f86181afd8ec457 # v0.1.0
         with:
           app-client-id: ${{ vars.TUFOPS_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.TUFOPS_APP_PRIVATE_KEY }}
@@ -309,8 +320,8 @@ tufops apply --event init
 
 This creates `root`, `targets` and the delegated roles on `sign/init`. The CLI signs `nightly`
 with the online key, and signs with your YubiKey if it is plugged in and needed. The other
-signers run `tufops sign` (§5). When the thresholds are met, CI merges `sign/init`, creates
-`snapshot` and `timestamp`, and publishes. Hand `metadata/root_history/1.root.json` to your
+signers run `tufops sign` (§5). When the thresholds are met, a maintainer merges the `sign/init`
+pull request, and CI creates `snapshot` and `timestamp` and publishes. Hand `metadata/root_history/1.root.json` to your
 clients as their trusted root.
 
 ## 4. Adding and changing files
@@ -327,12 +338,12 @@ tufops add --from ./build/out/ --to nightly/2026-09-23/        # a whole directo
 2. Hashes each file and uploads it to `targets/<dir>/<sha256>.<name>` in the bucket. Clients
    can't see it until metadata that lists it is published.
 3. Adds each file to the role whose `paths` match it, or to `targets` if none match.
-4. Signs with the online keys those roles need, and with your YubiKey if it is needed and
-   plugged in.
+4. Signs with the online keys those roles need. If your YubiKey is plugged in and needed, it
+   shows what you would sign and asks before signing (see §5).
 5. Commits and pushes the event, then prints its status.
 
 For a role signed only by online keys, CI merges and publishes straight away. For an offline
-role, CI opens a pull request and the signers take it from there.
+role, CI opens a pull request. The signers sign it, then a maintainer merges it.
 
 **Changing a file** is the same command with the same `--to`. The new content replaces the old
 entry. The old artifact stays in the bucket, so clients that still have older metadata keep
@@ -353,13 +364,25 @@ tufops sign          # sign the ones that need your YubiKey
 
 `tufops sign`:
 
-1. Finds the events that need your YubiKey's key and lets you pick which to sign, all of them by
-   default.
-2. Asks for your PIN.
-3. For each event, shows what it changes (roles, versions, signatures, and added, modified or
-   removed targets) and asks you to confirm.
-4. Signs each role that needs you. Touch the YubiKey when it blinks.
-5. Pushes. CI updates the pull request, and merges it if yours was the last signature needed.
+1. Finds the events that need your YubiKey's key and lets you pick which to review, all of them
+   by default.
+2. For each event, lists every role your key would sign before anything touches the YubiKey.
+   For each role it shows the new version and expiry, and every change to its signed metadata:
+   targets added, changed or removed (with size and SHA-256), keys and thresholds, delegations
+   and their paths. It then asks you to confirm.
+3. Only after you confirm does it ask for your PIN, once per session.
+4. Signs each role, naming the role and version as it goes. Touch the YubiKey when it blinks.
+5. Pushes. CI updates the pull request. Once yours was the last signature needed, a maintainer
+   can merge it.
+
+For example:
+
+```
+Your YubiKey (@alice, key 7f465af1) is needed to sign this role in sign/add-firmware-fw-1.2.bin:
+  firmware  version 3 → 4, expires 2026-12-23 03:33 UTC
+    target firmware/fw-1.2.bin added (1048576 bytes, sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08)
+Sign? [y/n]
+```
 
 On a wrong PIN the prompt tells you how many tries are left. Choose **Try again** to re-enter it.
 Choose **Give up** to skip that role. The rest of the event is still pushed.
@@ -375,14 +398,22 @@ tufops apply --event rotate-bob     # any event name
 ```
 
 `apply` carries your uncommitted `tufops.toml` edits onto the event branch. It rewrites the
-metadata to match: keys, thresholds, and delegated roles and their paths. It then signs, commits
-and pushes like `add`. Typical changes:
+metadata to match: keys, thresholds, and delegated roles and their paths. Any role whose
+metadata changes gets a new version that its keys must sign. It then signs, commits (the
+metadata and `tufops.toml`) and pushes like `add`. Typical changes:
 
 * **Add or replace a signer**: add their key under `[keys]` and list it in the roles.
 * **Change a threshold**: edit `threshold`.
 * **New delegated role**: add a `[roles.<name>]` with `paths`.
 * **Remove a delegated role**: delete its section. Its targets go with it.
 * **Rotate the online key**: create a new KMS key version and change `online` and `public_key`.
+* **Change how long a role is valid**: edit its `expires_days`. `apply` compares it with the
+  committed `tufops.toml` and gives the role a new version that expires `expires_days` from now.
+  Its `expires` changes, so its keys must sign it. For `snapshot` and `timestamp`, the event only
+  changes `tufops.toml`. Once it is merged, CI sees the change against the previous `main`
+  commit and signs new versions.
+* **Change when new versions are made**: edit `signing_days`. It is not part of the metadata,
+  so it needs no signatures, and it takes effect once the event is merged.
 
 A new root version needs signatures from the thresholds of both the old and the new root. The
 status shows these as `root` and `root (previous keys)`. Roles whose keys changed get a new
@@ -435,8 +466,8 @@ tufops publish           # verify and upload
 | `public_key` | The key's ECDSA P-256 public key as PEM (`tufops pubkey`). |
 | `[roles.<name>]` | A role. `root`, `targets`, `snapshot` and `timestamp` are required. |
 | `keys`, `threshold` | Which keys sign the role, and how many signatures it needs. |
-| `expires_days` | How long each new version is valid. |
-| `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. |
+| `expires_days` | How long each new version is valid. Changing it (with `tufops apply`) starts a new version with the new expiry, which must be signed. |
+| `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. Changing it needs no signatures. |
 | `paths` | Delegated roles only: target paths delegated from `targets`. A path ending in `/` covers everything under it. |
 
 Delegations are terminating, and clients try them in alphabetical order of role name. Keep

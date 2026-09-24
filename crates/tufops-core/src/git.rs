@@ -5,7 +5,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::config;
 use crate::repo::METADATA;
 
 /// Prefix of the branches that hold signing events.
@@ -60,6 +59,12 @@ impl Git {
     /// Paths of all files under `dir` at `rev`.
     pub fn ls(&self, rev: &str, dir: &str) -> Result<Vec<String>> {
         let out = self.run(&["ls-tree", "-r", "--name-only", rev, "--", dir])?;
+        Ok(out.lines().map(str::to_owned).collect())
+    }
+
+    /// Files that differ between `rev` and `HEAD`.
+    pub fn changed_files(&self, rev: &str) -> Result<Vec<String>> {
+        let out = self.run(&["diff", "--name-only", rev, "HEAD"])?;
         Ok(out.lines().map(str::to_owned).collect())
     }
 
@@ -133,17 +138,14 @@ impl Git {
         Ok(branch)
     }
 
-    /// Commits all changes to the metadata and config, returning false if there were none.
-    pub fn commit_all(&self, message: &str) -> Result<bool> {
-        self.run(&["add", "--all", "--", METADATA, config::FILE])?;
-        if self
-            .output(&["diff", "--cached", "--quiet"])?
-            .status
-            .success()
-        {
+    /// Commits all changes under `paths`, returning false if there were none.
+    pub fn commit(&self, message: &str, paths: &[&str]) -> Result<bool> {
+        self.run(&[&["add", "--all", "--"], paths].concat())?;
+        let diff = self.output(&[&["diff", "--cached", "--quiet", "--"], paths].concat())?;
+        if diff.status.success() {
             return Ok(false);
         }
-        self.run(&["commit", "--quiet", "-m", message])?;
+        self.run(&[&["commit", "--quiet", "-m", message, "--"], paths].concat())?;
         Ok(true)
     }
 

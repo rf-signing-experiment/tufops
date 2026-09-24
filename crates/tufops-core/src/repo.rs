@@ -276,24 +276,34 @@ impl Repo {
         self.put(role, &Pouf1::serialize_signed(&sigs, &raw)?)
     }
 
-    /// Replaces `role` with an unsigned `build(version, expires)` when that differs from the
-    /// current content, when the current version is in its signing period, or when the version in
-    /// `base` lacks signatures from the keys the role now has. The new version is one more than
-    /// the version in `base`. Returns whether the role changed.
+    /// Replaces `role` with an unsigned `build(version, expires)`, expiring `expires_days` from
+    /// now, when:
+    /// * that differs from the current content,
+    /// * the current version is in its signing period,
+    /// * `expires_days` differs from `previous`, the config the current metadata was built from,
+    /// * or the version in `base` lacks signatures from the keys the role now has.
+    ///
+    /// The new version is one more than the version in `base`. Returns whether the role changed.
     fn update<M: Metadata>(
         &mut self,
         base: &Repo,
         role: &str,
-        config: &RoleConfig,
+        (config, previous): (&RoleConfig, Option<&Config>),
         now: DateTime<Utc>,
         build: Build<M>,
     ) -> Result<bool> {
         let now = now.trunc_subsecs(0);
         if let Some(cur) = self.metadata::<M>(role)? {
             let unchanged = build(cur.version(), *cur.expires())? == cur;
+            let previous = previous.and_then(|p| p.roles.get(role));
+            let expiry_changed = previous.is_some_and(|p| p.expires_days != config.expires_days);
             let keys_changed = base.header(role)?.is_some_and(|(v, _)| v == cur.version())
                 && !self.missing_keys(base, role)?.is_empty();
-            if unchanged && !keys_changed && !config.in_signing_period(cur.expires(), now) {
+            if unchanged
+                && !expiry_changed
+                && !keys_changed
+                && !config.in_signing_period(cur.expires(), now)
+            {
                 return Ok(false);
             }
         }
@@ -305,29 +315,31 @@ impl Repo {
     }
 
     /// Brings root, targets and the delegated roles in line with `config`, and starts a new
-    /// version of any of them in its signing period. Returns the roles that changed.
+    /// version of any of them in its signing period. `previous` is the config the current
+    /// metadata was built from; roles whose `expires_days` differ from it get a new version too.
+    /// Returns the roles that changed.
     pub fn apply_config(
         &mut self,
         config: &Config,
+        previous: Option<&Config>,
         base: &Repo,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>> {
         let mut changed = vec![];
-        if self.update(
-            base,
-            "root",
-            config.role("root")?,
-            now,
-            root_builder(config)?,
-        )? {
+        let root = (config.role("root")?, previous);
+        if self.update(base, "root", root, now, root_builder(config)?)? {
             changed.push("root".to_owned());
         }
         let targets = self.metadata::<TargetsMetadata>("targets")?;
-        let build = targets_builder(
-            targets.map(|t| t.targets().clone()).unwrap_or_default(),
-            config_delegations(config)?,
-        );
-        if self.update(base, "targets", config.role("targets")?, now, build)? {
+        let map = targets.map(|t| t.targets().clone()).unwrap_or_default();
+        let build = targets_builder(map, config_delegations(config)?);
+        if self.update(
+            base,
+            "targets",
+            (config.role("targets")?, previous),
+            now,
+            build,
+        )? {
             changed.push("targets".to_owned());
         }
         for role in self.targets_roles() {
@@ -339,13 +351,8 @@ impl Repo {
         for (role, role_config) in config.delegations() {
             let targets = self.metadata::<TargetsMetadata>(role)?;
             let map = targets.map(|t| t.targets().clone()).unwrap_or_default();
-            if self.update(
-                base,
-                role,
-                role_config,
-                now,
-                targets_builder(map, Delegations::default()),
-            )? {
+            let build = targets_builder(map, Delegations::default());
+            if self.update(base, role, (role_config, previous), now, build)? {
                 changed.push(role.clone());
             }
         }
@@ -384,7 +391,7 @@ impl Repo {
             let mut map = cur.targets().clone();
             map.extend(new);
             let build = targets_builder(map, cur.delegations().clone());
-            if self.update(base, &role, config.role(&role)?, now, build)? {
+            if self.update(base, &role, (config.role(&role)?, None), now, build)? {
                 changed.push(role);
             }
         }
@@ -393,9 +400,15 @@ impl Repo {
 
     /// Starts new versions of the roles only online keys sign: online targets roles in their
     /// signing period, then snapshot and timestamp whenever what they describe changed or they
-    /// are in their signing period. The new versions still need signing. Returns the roles
-    /// changed.
-    pub fn update_online(&mut self, config: &Config, now: DateTime<Utc>) -> Result<Vec<String>> {
+    /// are in their signing period. Like `apply_config`, a changed `expires_days` since
+    /// `previous` also starts a new version. The new versions still need signing. Returns the
+    /// roles changed.
+    pub fn update_online(
+        &mut self,
+        config: &Config,
+        previous: Option<&Config>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
         let base = self.clone();
         let mut changed = vec![];
         for role in self.targets_roles() {
@@ -407,7 +420,7 @@ impl Repo {
             {
                 let cur = self.require::<TargetsMetadata>(&role)?;
                 let build = targets_builder(cur.targets().clone(), cur.delegations().clone());
-                if self.update(&base, &role, role_config, now, build)? {
+                if self.update(&base, &role, (role_config, previous), now, build)? {
                     changed.push(role);
                 }
             }
@@ -422,7 +435,13 @@ impl Repo {
             );
         }
         let build = Box::new(move |v, e| SnapshotMetadata::new(v, e, meta.clone(), HashMap::new()));
-        if self.update(&base, "snapshot", config.role("snapshot")?, now, build)? {
+        if self.update(
+            &base,
+            "snapshot",
+            (config.role("snapshot")?, previous),
+            now,
+            build,
+        )? {
             changed.push("snapshot".to_owned());
         }
 
@@ -430,7 +449,13 @@ impl Repo {
         let snapshot = MetadataDescription::new(version, None, HashMap::new())?;
         let build =
             Box::new(move |v, e| TimestampMetadata::new(v, e, snapshot.clone(), HashMap::new()));
-        if self.update(&base, "timestamp", config.role("timestamp")?, now, build)? {
+        if self.update(
+            &base,
+            "timestamp",
+            (config.role("timestamp")?, previous),
+            now,
+            build,
+        )? {
             changed.push("timestamp".to_owned());
         }
         Ok(changed)

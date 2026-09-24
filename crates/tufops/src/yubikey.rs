@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 pub struct YubiKeySigner {
     yubikey: Mutex<YubiKey>,
-    pin: Mutex<Zeroizing<String>>,
+    pin: Mutex<Option<Zeroizing<String>>>,
     public: PublicKey,
 }
 
@@ -38,7 +38,11 @@ impl YubiKeySigner {
 
     /// Sets the PIN used for each signature; slot 9c requires it before every signing operation.
     pub fn set_pin(&self, pin: String) {
-        *self.pin.lock().unwrap() = Zeroizing::new(pin);
+        *self.pin.lock().unwrap() = Some(Zeroizing::new(pin));
+    }
+
+    pub fn has_pin(&self) -> bool {
+        self.pin.lock().unwrap().is_some()
     }
 }
 
@@ -50,11 +54,11 @@ impl Signer for YubiKeySigner {
 
     async fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
         let mut yubikey = self.yubikey.lock().unwrap();
-        match yubikey.verify_pin(self.pin.lock().unwrap().as_bytes()) {
+        let pin = self.pin.lock().unwrap();
+        match yubikey.verify_pin(pin.as_ref().context("no PIN entered")?.as_bytes()) {
             Err(yubikey::Error::WrongPin { tries }) => bail!("wrong PIN, {tries} tries left"),
             result => result.context("verifying PIN")?,
         }
-        eprintln!("Signing… touch your YubiKey if it blinks.");
         let digest = Sha256::digest(msg);
         let signature = piv::sign_data(
             &mut yubikey,

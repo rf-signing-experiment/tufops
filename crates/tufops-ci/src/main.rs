@@ -1,26 +1,32 @@
 //! `tufops-ci`: the automation the tufops GitHub action runs on a checkout of the repository.
 //!
-//! On a push to a `sign/*` branch it keeps that signing event's pull request up to date and
-//! merges the event once it is fully signed. On main (pushes, schedule and manual runs) it signs
+//! On a push to a `sign/*` branch it keeps that signing event's pull request and
+//! `tufops/signatures` status up to date, and merges events only online keys sign. On main (pushes, schedule and manual runs) it signs
 //! new snapshot and timestamp versions, publishes, and starts signing events for offline roles
 //! about to expire.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
+use octocrab::models::StatusState;
 use octocrab::params::State;
 use tufops_cloud::open_store;
 use tufops_core::git::{Git, MAIN, REMOTE, SIGN_PREFIX};
 use tufops_core::publish::publish;
 use tufops_core::repo::METADATA;
+use tufops_core::status::RoleStatus;
 use tufops_core::{Config, EventStatus, Repo};
 
 /// Signing event CI starts when offline roles are about to expire.
 const REFRESH_EVENT: &str = "refresh";
 const FAILURE_TITLE: &str = "tufops automation failed";
+/// Commit status on signing events: make it a required check so pull requests missing
+/// signatures can't be merged.
+const STATUS_CONTEXT: &str = "tufops/signatures";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -59,6 +65,36 @@ impl GitHub {
             owner: owner.to_owned(),
             repo: repo.to_owned(),
         })
+    }
+
+    /// Sets the `tufops/signatures` status of commit `sha`: pending until every signature is in.
+    async fn set_status(&self, sha: &str, status: &EventStatus) -> Result<()> {
+        let (state, description) = if status.complete() {
+            (StatusState::Success, "All signatures are in".to_owned())
+        } else {
+            let waiting: Vec<_> = status.waiting_for().into_iter().collect();
+            (
+                StatusState::Pending,
+                format!("Waiting for {}", waiting.join(", ")),
+            )
+        };
+        let var = |name| std::env::var(name).unwrap_or_default();
+        let run = format!(
+            "{}/{}/actions/runs/{}",
+            var("GITHUB_SERVER_URL"),
+            var("GITHUB_REPOSITORY"),
+            var("GITHUB_RUN_ID")
+        );
+        // GitHub limits status descriptions to 140 characters.
+        let description = description.chars().take(140).collect();
+        (self.client.repos(&self.owner, &self.repo))
+            .create_status(sha.to_owned(), state)
+            .context(STATUS_CONTEXT.to_owned())
+            .description(description)
+            .target(run)
+            .send()
+            .await?;
+        Ok(())
     }
 
     /// Updates the description of the open pull request for `branch`, or creates one if `create`.
@@ -101,8 +137,9 @@ async fn main() -> Result<()> {
 }
 
 /// Merges main into the checked out signing event (without pushing that merge back), so the
-/// status reflects what merging the event would publish. Merges into main when every signature
-/// is in and only metadata changed; otherwise updates the event's pull request.
+/// status reflects what merging the event would publish. Sets the event's
+/// `tufops/signatures` status, then merges it into main if `merges_automatically` allows,
+/// and otherwise updates its pull request.
 async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
     let git = Git::new(dir);
     let branch = format!("{SIGN_PREFIX}{event}");
@@ -115,33 +152,33 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         git.run(&["merge", "--no-edit", &main]).with_context(|| {
             format!("{branch} conflicts with {MAIN}; start it again from {MAIN}")
         })?;
-        let changed_files = git.run(&["diff", "--name-only", &main, "HEAD"])?;
+        let changed_files = git.changed_files(&main)?;
         if changed_files.is_empty() {
             println!("{branch} changes nothing");
             return Ok(());
         }
         let config = Config::load(dir)?;
-        let status = EventStatus::new(&Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
-        let only_metadata = changed_files
-            .lines()
-            .all(|f| f.starts_with(&format!("{METADATA}/")));
+        let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
+        let merge = status.merges_automatically(&changed_files);
 
-        let mut body = format!(
-            "## Signing event `{branch}`\n\n{}\n",
-            status.to_markdown(&config)
-        );
-        body.push_str(match (status.complete(), only_metadata) {
-            (false, _) => "Signers still needed: check out the repository and run `tufops sign`.",
-            (true, true) => "All signatures are in: merging.",
-            (true, false) => {
-                "All signatures are in. This event changes more than metadata, so a maintainer \
-                 must review and merge it."
-            }
+        let mut body = format!("## Signing event `{branch}`\n\n{}\n", markdown(&status));
+        let waiting: Vec<_> = status.waiting_for().into_iter().collect();
+        body.push_str(&if !status.complete() {
+            format!(
+                "Waiting for signatures from {}. Signers: check out the repository and run \
+                 `tufops sign`.",
+                waiting.join(", ")
+            )
+        } else if merge {
+            "All signatures are in: merging.".to_owned()
+        } else {
+            "All signatures are in: a maintainer can now review and merge this pull request."
+                .to_owned()
         });
         println!("{body}");
-        // Events that merge straight away, such as those only online keys sign, need no pull
+        github.set_status(&tip, &status).await?;
+        // Only events that merge straight away, signed by online keys alone, skip the pull
         // request.
-        let merge = status.complete() && only_metadata;
         github.update_pr(&branch, &body, !merge).await?;
         if !merge {
             return Ok(());
@@ -160,8 +197,10 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
 async fn main_branch(dir: &Path) -> Result<()> {
     let git = Git::new(dir);
     let config = Config::load(dir)?;
-    let changed = tufops_cloud::update_online(&config, dir).await?;
-    if git.commit_all(&format!("Update {}", changed.join(", ")))?
+    // The config before the latest change to main, which the current metadata was built from.
+    let previous = Config::load_rev(&git, "HEAD^").ok();
+    let changed = tufops_cloud::update_online(&config, previous.as_ref(), dir).await?;
+    if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])?
         && let Err(err) = git.push(MAIN)
     {
         // If main moved on, the run for the newer commit does this work instead.
@@ -183,11 +222,14 @@ async fn main_branch(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let mut head = repo.clone();
-    let expiring = head.apply_config(&config, &repo, Utc::now())?;
+    let expiring = head.apply_config(&config, previous.as_ref(), &repo, Utc::now())?;
     if !expiring.is_empty() {
         let branch = git.checkout_event(REFRESH_EVENT)?;
         head.save(dir)?;
-        git.commit_all(&format!("Start new versions of {}", expiring.join(", ")))?;
+        git.commit(
+            &format!("Start new versions of {}", expiring.join(", ")),
+            &[METADATA],
+        )?;
         git.push(&branch)?;
         println!("Started {branch} for {expiring:?}; its workflow run opens the pull request");
     }
@@ -219,4 +261,60 @@ async fn report_failure(github: &GitHub) -> Result<()> {
         None => drop(issues.create(FAILURE_TITLE).body(body).send().await?),
     }
     Ok(())
+}
+
+/// The signing status as markdown for the pull request.
+fn markdown(status: &EventStatus) -> String {
+    let mut out =
+        String::from("| Role | Version | Expires | Signatures | Signed by | Waiting for |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    let names = |keys: &[tufops_core::status::Key]| {
+        let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
+        if names.is_empty() {
+            "-".to_owned()
+        } else {
+            names.join(", ")
+        }
+    };
+    for role in &status.roles {
+        let (version, expires) = version(role);
+        for req in &role.requirements {
+            let _ = writeln!(
+                out,
+                "| {}{} | {} | {} | {} {} of {} | {} | {} |",
+                role.role,
+                if req.previous_root {
+                    " (previous keys)"
+                } else {
+                    ""
+                },
+                version,
+                expires,
+                if req.met() { "✅" } else { "⏳" },
+                req.signed.len(),
+                req.threshold,
+                names(&req.signed),
+                names(&req.unsigned),
+            );
+        }
+    }
+    for role in status.roles.iter().filter(|r| !r.changes.is_empty()) {
+        let _ = writeln!(out, "\n**Changes to {}**\n", role.role);
+        for change in &role.changes {
+            let _ = writeln!(out, "- {change}");
+        }
+    }
+    out
+}
+
+/// The version and expiry columns: what main has, and what the event changes them to.
+fn version(role: &RoleStatus) -> (String, String) {
+    let date = |d: &DateTime<Utc>| d.format("%Y-%m-%d").to_string();
+    match role.base {
+        Some((version, expires)) if version != role.version => (
+            format!("{version} → {}", role.version),
+            format!("{} → {}", date(&expires), date(&role.expires)),
+        ),
+        _ => (role.version.to_string(), date(&role.expires)),
+    }
 }

@@ -3440,6 +3440,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "console",
  "dialoguer",
  "futures-util",
  "sha2 0.10.9",

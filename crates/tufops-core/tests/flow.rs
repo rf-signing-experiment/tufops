@@ -1,12 +1,12 @@
 //! A repository's life cycle with in-memory keys and storage.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{Duration, SubsecRound, Utc};
 use tuf::crypto::{EcdsaPrivateKey, HashAlgorithm, PrivateKey, PublicKey, SignatureScheme};
 use tuf::metadata::{TargetDescription, TargetPath};
 use tufops_core::backend::{BlobStore, Signer};
@@ -63,6 +63,16 @@ impl BlobStore for MemStore {
 }
 
 fn make_config(alice: &TestKey, bob: &TestKey, online: &TestKey, root_threshold: u32) -> Config {
+    make_config_with(alice, bob, online, root_threshold, 365)
+}
+
+fn make_config_with(
+    alice: &TestKey,
+    bob: &TestKey,
+    online: &TestKey,
+    root_threshold: u32,
+    root_days: u32,
+) -> Config {
     Config::parse(&format!(
         r#"
 storage = "gs://bucket/repo"
@@ -82,7 +92,7 @@ public_key = """{}"""
 [roles.root]
 keys = ["alice", "bob"]
 threshold = {root_threshold}
-expires_days = 365
+expires_days = {root_days}
 signing_days = 60
 
 [roles.targets]
@@ -135,21 +145,30 @@ async fn life_cycle() {
     // Initial signing event: everything is new.
     let main = Repo::default();
     let mut head = main.clone();
-    let changed = head.apply_config(&config, &main, now).unwrap();
+    let changed = head.apply_config(&config, None, &main, now).unwrap();
     assert_eq!(changed, ["root", "targets", "nightly"]);
     sign_all(&mut head, &main, &changed, &[&online, &alice]).await;
-    let status = EventStatus::new(&main, &head).unwrap();
+    let status = EventStatus::new(&config, &main, &head).unwrap();
     assert!(!status.complete());
-    assert_eq!(
-        status.needs(bob.public_key().key_id()),
-        BTreeSet::from(["root"])
-    );
+    let needs: Vec<_> = status
+        .needs(bob.public_key().key_id())
+        .iter()
+        .map(|r| r.role.as_str())
+        .collect();
+    assert_eq!(needs, ["root"]);
+    assert!(status.offline());
     sign_all(&mut head, &main, &changed, &[&bob]).await;
-    assert!(EventStatus::new(&main, &head).unwrap().complete());
+    let status = EventStatus::new(&config, &main, &head).unwrap();
+    assert!(status.complete());
+    let files = ["metadata/root.json".to_owned()];
+    assert!(
+        !status.merges_automatically(&files),
+        "offline events go through a pull request"
+    );
 
     // Merged into main: CI adds snapshot and timestamp, then publishes.
     let mut main = head;
-    let online_changed = main.update_online(&config, now).unwrap();
+    let online_changed = main.update_online(&config, None, now).unwrap();
     assert_eq!(online_changed, ["snapshot", "timestamp"]);
     sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
     let store = MemStore::default();
@@ -169,11 +188,24 @@ async fn life_cycle() {
         .unwrap();
     assert_eq!(changed, ["nightly"]);
     sign_all(&mut head, &main, &changed, &[&online]).await;
-    let status = EventStatus::new(&main, &head).unwrap();
+    let status = EventStatus::new(&config, &main, &head).unwrap();
     assert!(status.complete());
-    assert_eq!(status.targets[0].change, "added");
+    let files = ["metadata/nightly.json".to_owned()];
+    assert!(
+        status.merges_automatically(&files),
+        "online-only events merge by themselves"
+    );
+    let files = ["metadata/nightly.json".to_owned(), "tufops.toml".to_owned()];
+    assert!(
+        !status.merges_automatically(&files),
+        "config changes need review"
+    );
+    assert!(
+        status.roles[0].changes[0]
+            .starts_with("target nightly/app.bin added (5 bytes, sha256 2cf24dba")
+    );
     let mut main = head;
-    let online_changed = main.update_online(&config, now).unwrap();
+    let online_changed = main.update_online(&config, None, now).unwrap();
     sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
     assert!(
         publish::publish(&main, &store).await.is_err(),
@@ -188,14 +220,14 @@ async fn life_cycle() {
     // Rotating root to a threshold of 1 needs the previous root's threshold of 2 as well.
     let config = make_config(&alice, &bob, &online, 1);
     let mut head = main.clone();
-    let changed = head.apply_config(&config, &main, now).unwrap();
+    let changed = head.apply_config(&config, None, &main, now).unwrap();
     assert_eq!(changed, ["root"]);
     sign_all(&mut head, &main, &changed, &[&alice]).await;
-    assert!(!EventStatus::new(&main, &head).unwrap().complete());
+    assert!(!EventStatus::new(&config, &main, &head).unwrap().complete());
     sign_all(&mut head, &main, &changed, &[&bob]).await;
-    assert!(EventStatus::new(&main, &head).unwrap().complete());
+    assert!(EventStatus::new(&config, &main, &head).unwrap().complete());
     let mut main = head;
-    let online_changed = main.update_online(&config, now).unwrap();
+    let online_changed = main.update_online(&config, None, now).unwrap();
     sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
     publish::publish(&main, &store).await.unwrap();
 
@@ -204,25 +236,45 @@ async fn life_cycle() {
     let online2 = TestKey::new();
     let config = make_config(&alice, &bob, &online2, 1);
     let mut head = main.clone();
-    let changed = head.apply_config(&config, &main, now).unwrap();
+    let changed = head.apply_config(&config, None, &main, now).unwrap();
     assert_eq!(changed, ["root", "targets", "nightly"]);
     sign_all(&mut head, &main, &changed, &[&alice, &online2]).await;
-    assert!(EventStatus::new(&main, &head).unwrap().complete());
+    assert!(EventStatus::new(&config, &main, &head).unwrap().complete());
     let mut main = head;
-    let online_changed = main.update_online(&config, now).unwrap();
+    let online_changed = main.update_online(&config, None, now).unwrap();
     assert_eq!(online_changed, ["snapshot", "timestamp"]);
     sign_all(&mut main, &Repo::default(), &online_changed, &[&online2]).await;
     publish::publish(&main, &store).await.unwrap();
 
+    // Changing how long root is valid for gives root a new version with the new expiry, which
+    // its keys must sign; applying the same config again changes nothing more.
+    let old_config = make_config(&alice, &bob, &online2, 1);
+    let config = make_config_with(&alice, &bob, &online2, 1, 180);
+    let mut head = main.clone();
+    let changed = head
+        .apply_config(&config, Some(&old_config), &main, now)
+        .unwrap();
+    assert_eq!(changed, ["root"]);
+    let status = EventStatus::new(&config, &main, &head).unwrap();
+    let root = &status.roles[0];
+    assert_eq!(root.expires, now.trunc_subsecs(0) + Duration::days(180));
+    assert!(root.changes.is_empty(), "only version and expiry change");
+    assert!(!status.complete());
+    let again = head
+        .apply_config(&config, Some(&config), &main, now)
+        .unwrap();
+    assert!(again.is_empty());
+    let config = old_config;
+
     // Two days later the timestamp is refreshed; after ten months, offline roles need signing.
     let later = now + Duration::days(2);
     assert_eq!(
-        main.clone().update_online(&config, later).unwrap(),
+        main.clone().update_online(&config, None, later).unwrap(),
         ["timestamp"]
     );
     let mut head = main.clone();
     let changed = head
-        .apply_config(&config, &main, now + Duration::days(310))
+        .apply_config(&config, None, &main, now + Duration::days(310))
         .unwrap();
     assert_eq!(changed, ["root", "targets", "nightly"]);
 }

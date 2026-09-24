@@ -55,11 +55,15 @@ pub async fn sign_online(
 }
 
 /// Starts and signs new versions of the online roles in the working tree at `dir` that are due.
-/// Returns the roles changed.
-pub async fn update_online(config: &Config, dir: &std::path::Path) -> Result<Vec<String>> {
+/// `previous` is the config the current metadata was built from. Returns the roles changed.
+pub async fn update_online(
+    config: &Config,
+    previous: Option<&Config>,
+    dir: &std::path::Path,
+) -> Result<Vec<String>> {
     let mut repo = Repo::load(dir)?;
     let base = repo.clone();
-    let changed = repo.update_online(config, chrono::Utc::now())?;
+    let changed = repo.update_online(config, previous, chrono::Utc::now())?;
     sign_online(config, &base, &mut repo, &changed).await?;
     repo.save(dir)?;
     Ok(changed)

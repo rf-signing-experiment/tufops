@@ -172,7 +172,7 @@ impl Config {
                 },
             )) => owner.clone(),
             Some((name, _)) => format!("{name} (online)"),
-            None => format!("unknown key {}", &id.as_str()[..8.min(id.as_str().len())]),
+            None => "unknown key".to_owned(),
         }
     }
 }

@@ -1,5 +1,6 @@
 //! `tufops`: the command line tool signers and publishers use on a checkout of the repository.
 
+mod ui;
 mod yubikey;
 
 use std::io::IsTerminal;
@@ -8,14 +9,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use console::style;
 use dialoguer::{Confirm, MultiSelect, Password, Select};
 use futures_util::io::AllowStdIo;
 use tuf::crypto::HashAlgorithm;
 use tuf::metadata::{TargetDescription, TargetPath};
 use tufops_cloud::{open_signer, open_store, sign_online};
 use tufops_core::backend::Signer;
+use tufops_core::config::FILE as CONFIG_FILE;
 use tufops_core::git::{Git, MAIN, SIGN_PREFIX};
 use tufops_core::publish::{publish, target_object};
+use tufops_core::repo::METADATA;
 use tufops_core::{Config, EventStatus, Repo};
 use walkdir::WalkDir;
 
@@ -83,23 +87,40 @@ async fn main() -> Result<()> {
         Command::Add { from, to, event } => add(dir, &from, &to, event).await,
         Command::Apply { event } => {
             let mut ev = Event::open(dir, &event)?;
-            ev.head.apply_config(&ev.config, &ev.base, Utc::now())?;
-            ev.sign_and_finish("Apply tufops.toml").await
+            // Uncommitted edits to tufops.toml are what is being applied; the committed config is
+            // what the metadata was built from.
+            let previous = Config::load_rev(&ev.git, "HEAD").ok();
+            ev.head
+                .apply_config(&ev.config, previous.as_ref(), &ev.base, Utc::now())?;
+            ev.sign_and_finish("Apply tufops.toml", &[METADATA, CONFIG_FILE])
+                .await
         }
         Command::Online { push } => {
             let git = Git::new(dir);
             ensure!(git.current_branch()? == MAIN, "check out {MAIN} first");
-            let changed = tufops_cloud::update_online(&Config::load(dir)?, dir).await?;
-            if git.commit_all(&format!("Update {}", changed.join(", ")))? && push {
-                git.push(MAIN)?;
+            let previous = Config::load_rev(&git, "HEAD^").ok();
+            let config = Config::load(dir)?;
+            let changed = tufops_cloud::update_online(&config, previous.as_ref(), dir).await?;
+            if changed.is_empty() {
+                println!("Online roles are up to date.");
+            } else {
+                println!("Signed new versions of {}.", changed.join(", "));
             }
-            println!("Updated: {changed:?}");
+            if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])? && push {
+                git.push(MAIN)?;
+                println!("Pushed {MAIN}.");
+            }
             Ok(())
         }
         Command::Publish => {
             let store = open_store(&Config::load(dir)?.storage).await?;
             let uploaded = publish(&Repo::load(dir)?, store.as_ref()).await?;
-            println!("Uploaded: {uploaded:?}");
+            if uploaded.is_empty() {
+                println!("Storage is already up to date.");
+            }
+            for name in uploaded {
+                println!("Uploaded {name}");
+            }
             Ok(())
         }
         Command::Pubkey { online } => {
@@ -157,87 +178,123 @@ impl Event {
     }
 
     fn roles(&self) -> Vec<String> {
-        self.head
+        let roles = self
+            .head
             .roles()
-            .filter(|r| !matches!(*r, "snapshot" | "timestamp"))
-            .map(str::to_owned)
-            .collect()
+            .filter(|r| !matches!(*r, "snapshot" | "timestamp"));
+        roles.map(str::to_owned).collect()
     }
 
-    /// Signs every role that needs the YubiKey's key. A failed signature (such as a wrong PIN)
-    /// can be retried; a role given up on is left for later.
-    async fn sign_offline(&mut self, yubikey: &YubiKeySigner) -> Result<()> {
-        for role in self.roles() {
-            if !self
-                .head
-                .missing_keys(&self.base, &role)?
-                .contains(yubikey.public_key())
-            {
-                continue;
-            }
-            println!("Signing {role}");
-            while let Err(err) = self.head.sign(&role, yubikey).await {
-                if !try_again(&err)? {
-                    eprintln!("Skipped {role}");
-                    break;
+    fn status(&self) -> Result<EventStatus> {
+        EventStatus::new(&self.config, &self.base, &self.head)
+    }
+
+    /// Shows what the YubiKey would sign in this event and, if the user agrees, signs it. A
+    /// failed signature (such as a wrong PIN) can be retried; a role given up on is left for
+    /// later. Returns whether anything was signed.
+    async fn sign_offline(&mut self, yubikey: &YubiKeySigner) -> Result<bool> {
+        let me = yubikey.public_key().key_id().clone();
+        let status = self.status()?;
+        let needed = status.needs(&me);
+        if needed.is_empty() {
+            return Ok(false);
+        }
+        println!(
+            "\nYour YubiKey ({}, key {}) is needed to sign {} in {}:",
+            self.config.describe_key(&me),
+            me.as_str().get(..8).unwrap_or_default(),
+            if needed.len() == 1 {
+                "this role"
+            } else {
+                "these roles"
+            },
+            style(&self.branch).bold()
+        );
+        needed.iter().for_each(|role| ui::print_role(role));
+        if !Confirm::new().with_prompt("Sign?").interact()? {
+            println!("Not signed.");
+            return Ok(false);
+        }
+        let needed: Vec<_> = needed.iter().map(|r| (r.role.clone(), r.version)).collect();
+        if !yubikey.has_pin() {
+            ask_pin(yubikey)?;
+        }
+        let mut signed = false;
+        for (role, version) in needed {
+            loop {
+                println!("Signing {role} version {version}: touch your YubiKey when it blinks.");
+                match self.head.sign(&role, yubikey).await {
+                    Ok(()) => signed = true,
+                    Err(err) if try_again(&err)? => {
+                        ask_pin(yubikey)?;
+                        continue;
+                    }
+                    Err(_) => println!("Skipped {role}."),
                 }
-                ask_pin(yubikey)?;
+                break;
             }
         }
-        Ok(())
+        Ok(signed)
     }
 
     /// Signs with the online keys the event needs, and with the YubiKey if one is plugged in and
     /// needed, then commits and pushes the event.
-    async fn sign_and_finish(mut self, message: &str) -> Result<()> {
+    async fn sign_and_finish(mut self, message: &str, paths: &[&str]) -> Result<()> {
         let roles = self.roles();
         while let Err(err) = sign_online(&self.config, &self.base, &mut self.head, &roles).await {
             ensure!(try_again(&err)?, "online signing failed");
         }
-        let status = EventStatus::new(&self.base, &self.head)?;
-        if !status.complete() {
+        if !self.status()?.complete() {
             match YubiKeySigner::open() {
-                Ok(yubikey) if !status.needs(yubikey.public_key().key_id()).is_empty() => {
-                    ask_pin(&yubikey)?;
-                    self.sign_offline(&yubikey).await?;
-                }
-                Ok(_) => {}
+                Ok(yubikey) => drop(self.sign_offline(&yubikey).await?),
                 Err(err) => println!("Not signing with a YubiKey: {err:#}"),
             }
         }
-        self.finish(message)
+        self.finish(message, paths)
     }
 
-    fn finish(self, message: &str) -> Result<()> {
+    /// Commits `paths` and pushes the event, then shows its status.
+    fn finish(self, message: &str, paths: &[&str]) -> Result<()> {
         self.head.save(self.git.dir())?;
-        if self.git.commit_all(message)? {
+        let committed = self.git.commit(message, paths)?;
+        if committed {
             self.git.push(&self.branch)?;
+        }
+        let status = self.status()?;
+        println!();
+        ui::print_event(&self.branch, &status);
+        println!();
+        if committed {
             println!("Pushed {}.", self.branch);
         } else {
-            println!("Nothing changed in {}.", self.branch);
+            println!("Nothing new to push.");
         }
-        let status = EventStatus::new(&self.base, &self.head)?;
-        println!("\n{}", status.to_markdown(&self.config));
-        if status.complete() {
-            println!("All signatures are in: CI will merge {}.", self.branch);
-        } else {
+        let changed_files = self.git.changed_files(&Git::remote_ref(MAIN))?;
+        if !status.complete() {
+            let waiting: Vec<_> = status.waiting_for().into_iter().collect();
             println!(
-                "CI will open a pull request; the signers listed can sign with `tufops sign`."
+                "Waiting for signatures from {}. CI opens a pull request; signers run `tufops sign`.",
+                waiting.join(", ")
             );
+        } else if status.merges_automatically(&changed_files) {
+            println!("All signatures are in: CI merges and publishes it.");
+        } else {
+            println!("All signatures are in: CI opens a pull request for a maintainer to merge.");
         }
         Ok(())
     }
 }
 
 /// Status of every open signing event on the remote.
-fn event_statuses(git: &Git) -> Result<Vec<(String, Config, EventStatus)>> {
+fn event_statuses(git: &Git) -> Result<Vec<(String, EventStatus)>> {
     git.fetch()?;
     let base = Repo::load_rev(git, &Git::remote_ref(MAIN))?;
     let mut statuses = vec![];
     for event in git.remote_events()? {
         let rev = Git::remote_ref(&format!("{SIGN_PREFIX}{event}"));
-        let status = EventStatus::new(&base, &Repo::load_rev(git, &rev)?)?;
-        statuses.push((event, Config::load_rev(git, &rev)?, status));
+        let config = Config::load_rev(git, &rev)?;
+        let status = EventStatus::new(&config, &base, &Repo::load_rev(git, &rev)?)?;
+        statuses.push((event, status));
     }
     Ok(statuses)
 }
@@ -247,8 +304,9 @@ fn status(dir: &Path) -> Result<()> {
     if statuses.is_empty() {
         println!("No open signing events.");
     }
-    for (event, config, status) in statuses {
-        println!("## {SIGN_PREFIX}{event}\n\n{}", status.to_markdown(&config));
+    for (event, status) in statuses {
+        ui::print_event(&format!("{SIGN_PREFIX}{event}"), &status);
+        println!();
     }
     Ok(())
 }
@@ -263,43 +321,35 @@ async fn sign(dir: &Path, mut events: Vec<String>) -> Result<()> {
     let me = yubikey.public_key().key_id().clone();
     let pending: Vec<_> = event_statuses(&Git::new(dir))?
         .into_iter()
-        .filter(|(event, _, status)| {
+        .filter(|(event, status)| {
             !status.needs(&me).is_empty() && (events.is_empty() || events.contains(event))
         })
         .collect();
     if pending.is_empty() {
-        println!("No signing events need your key ({me}).");
+        println!("No signing events need your YubiKey (key {me}).");
         return Ok(());
     }
     if events.is_empty() {
         let items: Vec<_> = pending
             .iter()
-            .map(|(event, _, status)| format!("{event} (signs {:?})", status.needs(&me)))
+            .map(|(event, status)| {
+                let roles: Vec<_> = status.needs(&me).iter().map(|r| r.role.as_str()).collect();
+                format!("{SIGN_PREFIX}{event} (signs {})", roles.join(", "))
+            })
             .collect();
         let chosen = MultiSelect::new()
-            .with_prompt("Signing events to sign (space to toggle)")
+            .with_prompt("Signing events to review (space to toggle)")
             .items(&items)
             .defaults(&vec![true; items.len()])
             .interact()?;
         events = chosen.into_iter().map(|i| pending[i].0.clone()).collect();
     }
 
-    ask_pin(&yubikey)?;
     for event in events {
         let mut ev = Event::open(dir, &event)?;
-        println!(
-            "\n## {}\n\n{}",
-            ev.branch,
-            EventStatus::new(&ev.base, &ev.head)?.to_markdown(&ev.config)
-        );
-        if Confirm::new()
-            .with_prompt(format!("Sign {}?", ev.branch))
-            .default(true)
-            .interact()?
-        {
-            ev.sign_offline(&yubikey).await?;
+        if ev.sign_offline(&yubikey).await? {
             let message = format!("Sign with {}", ev.config.describe_key(&me));
-            ev.finish(&message)?;
+            ev.finish(&message, &[METADATA])?;
         }
     }
     Ok(())
@@ -373,5 +423,5 @@ async fn add(dir: &Path, from: &Path, to: &str, event: Option<String>) -> Result
         .head
         .add_targets(&ev.config, &ev.base, targets, Utc::now())?;
     println!("Added to {}", changed.join(", "));
-    ev.sign_and_finish(&format!("Add {to}")).await
+    ev.sign_and_finish(&format!("Add {to}"), &[METADATA]).await
 }
