@@ -55,7 +55,8 @@ A signing event is a `sign/<name>` branch that changes metadata. It goes through
      changed, CI merges it into `main`. Online-only changes therefore go live without a pull
      request.
    * Otherwise CI opens a pull request. Its description lists every change and who has and
-     hasn't signed, and CI keeps it up to date.
+     hasn't signed, and CI keeps it up to date. Added and changed target files link to their
+     uploads in the bucket, so reviewers can download exactly what they are asked to sign.
    * Either way, CI sets a `tufops/signatures` status on the event's latest commit. It stays
      pending until every signature is in, so as a required check it blocks merging (§3.2).
 3. Signers run `tufops sign` to add their signatures. Each push updates the pull request.

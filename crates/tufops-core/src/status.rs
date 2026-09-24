@@ -1,13 +1,15 @@
 //! What a signing event changes, and who still has to sign it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tuf::crypto::{HashAlgorithm, KeyId, PublicKey};
-use tuf::metadata::{RootMetadata, TargetDescription, TargetsMetadata};
+use tuf::metadata::{RootMetadata, TargetDescription, TargetPath, TargetsMetadata};
 
 use crate::config::Config;
+use crate::publish::target_object;
 use crate::repo::{METADATA, Repo};
 
 /// A key that signs a role, as the config names it.
@@ -35,6 +37,50 @@ impl Requirement {
     }
 }
 
+/// A change to a role's signed metadata.
+#[derive(Debug)]
+pub enum Change {
+    /// A target added, changed or removed.
+    Target {
+        path: String,
+        kind: &'static str,
+        /// The new file, unless the target was removed.
+        file: Option<TargetFile>,
+    },
+    /// Any other change, in words.
+    Other(String),
+}
+
+#[derive(Debug)]
+pub struct TargetFile {
+    pub length: u64,
+    pub sha256: String,
+    /// Where the file was uploaded, relative to the storage root.
+    pub object: String,
+}
+
+impl fmt::Display for Change {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Change::Target {
+                path,
+                kind,
+                file: Some(file),
+            } => write!(
+                f,
+                "target {path} {kind} ({} bytes, sha256 {})",
+                file.length, file.sha256
+            ),
+            Change::Target {
+                path,
+                kind,
+                file: None,
+            } => write!(f, "target {path} {kind}"),
+            Change::Other(text) => f.write_str(text),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RoleStatus {
     pub role: String,
@@ -42,8 +88,8 @@ pub struct RoleStatus {
     pub base: Option<(u32, DateTime<Utc>)>,
     pub version: u32,
     pub expires: DateTime<Utc>,
-    /// What the metadata changes compared with main, one line each.
-    pub changes: Vec<String>,
+    /// What the metadata changes compared with main.
+    pub changes: Vec<Change>,
     pub requirements: Vec<Requirement>,
 }
 
@@ -164,7 +210,7 @@ fn short(id: &KeyId) -> &str {
 }
 
 /// Describes how `role` in `head` differs from `base`, from the metadata that gets signed.
-fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<String>> {
+fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<Change>> {
     let mut out = vec![];
     if role == "root" {
         let new = head.root()?;
@@ -213,7 +259,7 @@ fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<
         for name in old_d.keys().chain(new_d.keys()).collect::<BTreeSet<_>>() {
             let what = format!("delegation {name}");
             let Some(d) = new_d.get(name) else {
-                out.push(format!("{what} removed"));
+                out.push(Change::Other(format!("{what} removed")));
                 continue;
             };
             let old = old_d.get(name);
@@ -224,37 +270,45 @@ fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<
                 .collect();
             let new_paths: BTreeSet<_> = d.paths().iter().map(|p| p.to_string()).collect();
             if old.is_none() {
-                out.push(format!("{what} added"));
+                out.push(Change::Other(format!("{what} added")));
             }
             new_paths
                 .difference(&old_paths)
-                .for_each(|p| out.push(format!("{what}: path {p} added")));
+                .for_each(|p| out.push(Change::Other(format!("{what}: path {p} added"))));
             old_paths
                 .difference(&new_paths)
-                .for_each(|p| out.push(format!("{what}: path {p} removed")));
+                .for_each(|p| out.push(Change::Other(format!("{what}: path {p} removed"))));
             let old = old.map(|o| (o.threshold(), o.key_ids()));
             key_changes(&mut out, config, &what, old, (d.threshold(), d.key_ids()));
         }
 
         let empty = HashMap::new();
         let old_targets = old.as_ref().map_or(&empty, |o| o.targets());
-        let describe = |d: &TargetDescription| {
-            let hash = d
+        let file = |path: &TargetPath, d: &TargetDescription| -> Result<_> {
+            let sha256 = d
                 .hashes()
                 .get(&HashAlgorithm::Sha256)
-                .map(|h| h.to_string());
-            format!("{} bytes, sha256 {}", d.length(), hash.unwrap_or_default())
+                .context("no sha256")?;
+            let object = target_object(path, d)?;
+            Ok(Some(TargetFile {
+                length: d.length(),
+                sha256: sha256.to_string(),
+                object,
+            }))
         };
         let paths: BTreeSet<_> = old_targets.keys().chain(new.targets().keys()).collect();
         for path in paths {
-            match (old_targets.get(path), new.targets().get(path)) {
-                (None, Some(d)) => out.push(format!("target {path} added ({})", describe(d))),
-                (Some(_), None) => out.push(format!("target {path} removed")),
-                (Some(a), Some(b)) if a != b => {
-                    out.push(format!("target {path} changed ({})", describe(b)))
-                }
-                _ => {}
-            }
+            let (kind, file) = match (old_targets.get(path), new.targets().get(path)) {
+                (None, Some(d)) => ("added", file(path, d)?),
+                (Some(_), None) => ("removed", None),
+                (Some(a), Some(b)) if a != b => ("changed", file(path, b)?),
+                _ => continue,
+            };
+            out.push(Change::Target {
+                path: path.to_string(),
+                kind,
+                file,
+            });
         }
     }
 
@@ -263,7 +317,7 @@ fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<
 
 /// Describes the keys and threshold of a role changing from `old` to `new`.
 fn key_changes(
-    out: &mut Vec<String>,
+    out: &mut Vec<Change>,
     config: &Config,
     what: &str,
     old: Option<(u32, &HashSet<KeyId>)>,
@@ -276,15 +330,15 @@ fn key_changes(
     let removed: BTreeSet<_> = old_ids.difference(ids).map(name).collect();
     added
         .iter()
-        .for_each(|k| out.push(format!("{what}: key {k} added")));
+        .for_each(|k| out.push(Change::Other(format!("{what}: key {k} added"))));
     removed
         .iter()
-        .for_each(|k| out.push(format!("{what}: key {k} removed")));
+        .for_each(|k| out.push(Change::Other(format!("{what}: key {k} removed"))));
     match old {
-        None => out.push(format!("{what}: threshold {threshold}")),
-        Some(_) if old_threshold != threshold => {
-            out.push(format!("{what}: threshold {old_threshold} → {threshold}"))
-        }
+        None => out.push(Change::Other(format!("{what}: threshold {threshold}"))),
+        Some(_) if old_threshold != threshold => out.push(Change::Other(format!(
+            "{what}: threshold {old_threshold} → {threshold}"
+        ))),
         Some(_) => {}
     }
 }

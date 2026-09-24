@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use tufops_core::backend::{BlobStore, Signer};
 use tufops_core::{Config, Repo};
+use url::Url;
 
 mod gcp;
 
@@ -13,6 +14,23 @@ mod gcp;
 pub async fn open_store(url: &str) -> Result<Box<dyn BlobStore>> {
     if let Some(path) = url.strip_prefix("gs://") {
         return Ok(Box::new(gcp::Gcs::new(path).await?));
+    }
+    bail!("unsupported storage URL {url}: expected gs://bucket[/prefix]")
+}
+
+/// The public HTTPS URL of object `name` in the storage at `url`.
+pub fn public_url(url: &str, name: &str) -> Result<Url> {
+    if let Some(path) = url.strip_prefix("gs://") {
+        let mut public = Url::parse("https://storage.googleapis.com/")?;
+        let segments = path
+            .split('/')
+            .chain(name.split('/'))
+            .filter(|s| !s.is_empty());
+        public
+            .path_segments_mut()
+            .expect("https URLs have paths")
+            .extend(segments);
+        return Ok(public);
     }
     bail!("unsupported storage URL {url}: expected gs://bucket[/prefix]")
 }

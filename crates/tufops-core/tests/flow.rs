@@ -202,6 +202,7 @@ async fn life_cycle() {
     );
     assert!(
         status.roles[0].changes[0]
+            .to_string()
             .starts_with("target nightly/app.bin added (5 bytes, sha256 2cf24dba")
     );
     let mut main = head;

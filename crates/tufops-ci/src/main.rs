@@ -14,11 +14,11 @@ use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
 use octocrab::models::StatusState;
 use octocrab::params::State;
-use tufops_cloud::open_store;
+use tufops_cloud::{open_store, public_url};
 use tufops_core::git::{Git, MAIN, REMOTE, SIGN_PREFIX};
 use tufops_core::publish::publish;
 use tufops_core::repo::METADATA;
-use tufops_core::status::RoleStatus;
+use tufops_core::status::{Change, RoleStatus};
 use tufops_core::{Config, EventStatus, Repo};
 
 /// Signing event CI starts when offline roles are about to expire.
@@ -161,7 +161,10 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
         let merge = status.merges_automatically(&changed_files);
 
-        let mut body = format!("## Signing event `{branch}`\n\n{}\n", markdown(&status));
+        let mut body = format!(
+            "## Signing event `{branch}`\n\n{}\n",
+            markdown(&status, &config.storage)?
+        );
         let waiting: Vec<_> = status.waiting_for().into_iter().collect();
         body.push_str(&if !status.complete() {
             format!(
@@ -263,8 +266,9 @@ async fn report_failure(github: &GitHub) -> Result<()> {
     Ok(())
 }
 
-/// The signing status as markdown for the pull request.
-fn markdown(status: &EventStatus) -> String {
+/// The signing status as markdown for the pull request, linking target files to their uploads
+/// in `storage`.
+fn markdown(status: &EventStatus, storage: &str) -> Result<String> {
     let mut out =
         String::from("| Role | Version | Expires | Signatures | Signed by | Waiting for |\n");
     out.push_str("|---|---|---|---|---|---|\n");
@@ -301,10 +305,28 @@ fn markdown(status: &EventStatus) -> String {
     for role in status.roles.iter().filter(|r| !r.changes.is_empty()) {
         let _ = writeln!(out, "\n**Changes to {}**\n", role.role);
         for change in &role.changes {
-            let _ = writeln!(out, "- {change}");
+            let _ = match change {
+                Change::Target {
+                    path,
+                    kind,
+                    file: Some(file),
+                } => writeln!(
+                    out,
+                    "- target [`{path}`](<{}>) {kind} ({} bytes, sha256 `{}`)",
+                    public_url(storage, &file.object)?,
+                    file.length,
+                    file.sha256
+                ),
+                Change::Target {
+                    path,
+                    kind,
+                    file: None,
+                } => writeln!(out, "- target `{path}` {kind}"),
+                Change::Other(text) => writeln!(out, "- {text}"),
+            };
         }
     }
-    out
+    Ok(out)
 }
 
 /// The version and expiry columns: what main has, and what the event changes them to.

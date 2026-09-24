@@ -32,6 +32,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 toml = "1"
 tuf = { git = "https://github.com/rf-signing-experiment/rust-tuf.git", branch = "tbdsigning" }
+url = "2"
 walkdir = "2"
 x509-cert = "0.2"
 yubikey = "0.8"

@@ -15,3 +15,4 @@ tokio.workspace = true
 chrono.workspace = true
 tuf.workspace = true
 tufops-core.workspace = true
+url.workspace = true
