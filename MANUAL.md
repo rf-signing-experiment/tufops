@@ -355,6 +355,18 @@ role, CI opens a pull request. The signers sign it, then a maintainer merges it.
 entry. The old artifact stays in the bucket, so clients that still have older metadata keep
 working.
 
+**Removing files** takes their target paths; a path ending in `/` removes everything under it:
+
+```sh
+tufops rm firmware/fw-1.1.bin
+tufops rm nightly/2026-09-01/ nightly/2026-09-02/
+```
+
+`rm` removes each matching target from whichever role lists it, in a signing event (by default
+`sign/rm-<first path>`; `--event` and `--restart` work as for `add`). It signs and pushes like
+`add`, and the status lists each removed target. The uploaded files stay in the bucket, so
+clients holding older metadata can still download them.
+
 If an upload or signature fails, tufops shows the error and asks whether to **try again** or
 **give up**. You can fix the problem (log in to `gcloud`, re-plug the YubiKey) and continue
 without starting over. Nothing is pushed until the end.
@@ -428,8 +440,8 @@ metadata and `tufops.toml`) and pushes like `add`. Typical changes:
   `channels-nightly` (`channels/nightly/`) moves its targets into those two, and anything else
   under `channels/` into `targets`. The status summarizes moves per pair of roles, as in
   "3612 targets moved here unchanged from channels". Only targets whose content changes are
-  listed individually. The keys of every role gaining or losing targets must sign. There is no
-  command to remove targets yet.
+  listed individually. The keys of every role gaining or losing targets must sign. To remove
+  targets, use `tufops rm` (§4).
 * **Rotate the online key**: create a new KMS key version and change `online` and `public_key`.
 * **Change how long a role is valid**: edit its `expires_days`. `apply` compares it with the
   committed `tufops.toml` and gives the role a new version that expires `expires_days` from now.
@@ -511,6 +523,7 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
 | `tufops add --from PATH --to PATH [--event NAME] [--restart]` | Upload artifacts and add them in a signing event. |
+| `tufops rm PATH… [--event NAME] [--restart]` | Remove targets (a path ending in `/` removes everything under it) in a signing event; their uploads are kept. |
 | `tufops apply [--event NAME] [--restart]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
 | `tufops online [--push]` | On `main`: sign new online role versions that are due. |
 | `tufops publish` | Verify the checkout and upload changed metadata. |

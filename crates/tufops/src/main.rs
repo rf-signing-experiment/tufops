@@ -59,6 +59,18 @@ enum Command {
         #[arg(long)]
         restart: bool,
     },
+    /// Remove artifacts from the repository in a signing event; their uploads are kept.
+    Rm {
+        /// Target paths to remove; a path ending in `/` removes everything under it.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Signing event to remove in; defaults to one named after the first path.
+        #[arg(long)]
+        event: Option<String>,
+        /// Start the event over from main, discarding its earlier changes and signatures.
+        #[arg(long)]
+        restart: bool,
+    },
     /// Update the metadata to match tufops.toml, in a signing event.
     Apply {
         #[arg(long, default_value = "config")]
@@ -96,6 +108,11 @@ async fn main() -> Result<()> {
             event,
             restart,
         } => add(dir, &from, &to, event, restart).await,
+        Command::Rm {
+            paths,
+            event,
+            restart,
+        } => rm(dir, &paths, event, restart).await,
         Command::Apply { event, restart } => {
             let mut ev = Event::open(dir, &event, restart)?;
             // Uncommitted edits to tufops.toml are what is being applied; the committed config is
@@ -292,13 +309,15 @@ impl Event {
         if !status.complete() {
             let waiting: Vec<_> = status.waiting_for().into_iter().collect();
             println!(
-                "Waiting for signatures from {}. CI opens a pull request; signers run `tufops sign`.",
+                "Waiting for signatures from {}. Track status via PR.",
                 waiting.join(", ")
             );
         } else if status.merges_automatically(&changed_files) {
-            println!("All signatures are in: CI merges and publishes it.");
+            println!("All signatures are in: this change will automatically merge");
         } else {
-            println!("All signatures are in: CI opens a pull request for a maintainer to merge.");
+            println!(
+                "All signatures are in: this change requires a maintainer to complete the PR."
+            );
         }
         Ok(())
     }
@@ -417,18 +436,7 @@ async fn add(
     restart: bool,
 ) -> Result<()> {
     let files = collect_files(from, to)?;
-    let slug: String = to
-        .trim_matches('/')
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let event = event.unwrap_or_else(|| format!("add-{slug}"));
+    let event = event.unwrap_or_else(|| format!("add-{}", slug(to)));
     let mut ev = Event::open(dir, &event, restart)?;
     let store = open_store(&ev.config.storage).await?;
 
@@ -450,4 +458,27 @@ async fn add(
         .add_targets(&ev.config, &ev.base, targets, Utc::now())?;
     println!("Added to {}", changed.join(", "));
     ev.sign_and_finish(&format!("Add {to}"), &[METADATA]).await
+}
+
+/// `path` as part of a branch name.
+fn slug(path: &str) -> String {
+    let keep = |c: char| c.is_ascii_alphanumeric() || c == '.';
+    let chars = path.trim_matches('/').chars();
+    chars.map(|c| if keep(c) { c } else { '-' }).collect()
+}
+
+async fn rm(dir: &Path, paths: &[String], event: Option<String>, restart: bool) -> Result<()> {
+    let patterns: Vec<_> = paths
+        .iter()
+        .map(|p| TargetPath::new(p.clone()).with_context(|| format!("target path {p}")))
+        .collect::<Result<_>>()?;
+    let event = event.unwrap_or_else(|| format!("rm-{}", slug(&paths[0])));
+    let mut ev = Event::open(dir, &event, restart)?;
+    let (changed, removed) = ev
+        .head
+        .remove_targets(&ev.config, &ev.base, &patterns, Utc::now())?;
+    ensure!(removed > 0, "no targets match {}", paths.join(", "));
+    println!("Removing {removed} targets from {}", changed.join(", "));
+    ev.sign_and_finish(&format!("Remove {}", paths.join(", ")), &[METADATA])
+        .await
 }

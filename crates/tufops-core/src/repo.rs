@@ -407,6 +407,34 @@ impl Repo {
         Ok(changed)
     }
 
+    /// Removes the targets matching `patterns` from every role listing them: a pattern matches
+    /// itself and, if it ends in `/`, everything under it, like delegation paths. Returns the
+    /// roles changed and how many targets were removed.
+    pub fn remove_targets(
+        &mut self,
+        config: &Config,
+        base: &Repo,
+        patterns: &[TargetPath],
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<String>, usize)> {
+        let matches = |path: &TargetPath| patterns.iter().any(|p| path == p || path.is_child(p));
+        let (mut changed, mut removed) = (vec![], 0);
+        for role in self.targets_roles() {
+            let cur = self.require::<TargetsMetadata>(&role)?;
+            let mut map = cur.targets().clone();
+            map.retain(|path, _| !matches(path));
+            if map.len() == cur.targets().len() {
+                continue;
+            }
+            removed += cur.targets().len() - map.len();
+            let build = targets_builder(map, cur.delegations().clone());
+            if self.update(base, &role, (config.role(&role)?, None), now, build)? {
+                changed.push(role);
+            }
+        }
+        Ok((changed, removed))
+    }
+
     /// Starts new versions of the roles only online keys sign: online targets roles in their
     /// signing period, then snapshot and timestamp whenever what they describe changed or they
     /// are in their signing period. Like `apply_config`, a changed `expires_days` since

@@ -440,6 +440,29 @@ async fn delegated_paths() {
     publish(&mut repo, &config).await;
     assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
 
+    // Removing a directory and a file takes them out of whichever roles list them. Their uploads
+    // stay, but clients no longer find them.
+    let main = repo.clone();
+    let remove = ["b/one/", "z", "nothing/"].map(|p| TargetPath::new(p).unwrap());
+    let (changed, removed) = repo.remove_targets(&config, &main, &remove, now).unwrap();
+    assert_eq!(
+        (changed, removed),
+        (vec!["alpha".into(), "beta-one".into()], 2)
+    );
+    let status = EventStatus::new(&config, &main, &repo).unwrap();
+    assert_eq!(changes(&status, "beta-one"), ["target b/one/p removed"]);
+    publish(&mut repo, &config).await;
+    let found = client_finds(&repo, &store, &paths).await;
+    assert_eq!(found, [true, true, false, true, false]);
+    let none = [TargetPath::new("nothing/").unwrap()];
+    assert_eq!(
+        repo.clone()
+            .remove_targets(&config, &repo, &none, now)
+            .unwrap()
+            .1,
+        0
+    );
+
     // Paths that more than one role covers are rejected; a mere common prefix is fine.
     for overlapping in ["b/", "b/sub/", "b/file"] {
         let err = delegating_config(&key, &[("alpha", overlapping), ("beta", "b/")]);
