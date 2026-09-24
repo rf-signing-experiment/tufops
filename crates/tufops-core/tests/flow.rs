@@ -60,6 +60,10 @@ impl BlobStore for MemStore {
     async fn put_file(&self, name: &str, path: &Path) -> Result<()> {
         self.put(name, std::fs::read(path)?).await
     }
+
+    fn public_url(&self, name: &str) -> String {
+        format!("https://example.test/{name}")
+    }
 }
 
 fn make_config(alice: &TestKey, bob: &TestKey, online: &TestKey, root_threshold: u32) -> Config {

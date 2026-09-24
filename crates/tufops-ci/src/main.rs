@@ -14,7 +14,8 @@ use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
 use octocrab::models::StatusState;
 use octocrab::params::State;
-use tufops_cloud::{open_store, public_url};
+use tufops_cloud::open_store;
+use tufops_core::backend::BlobStore;
 use tufops_core::git::{Git, MAIN, REMOTE, SIGN_PREFIX};
 use tufops_core::publish::publish;
 use tufops_core::repo::METADATA;
@@ -158,12 +159,14 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
             return Ok(());
         }
         let config = Config::load(dir)?;
+        // Only builds clients: this job has no cloud credentials, and needs none for URLs.
+        let store = open_store(&config.storage).await?;
         let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
         let merge = status.merges_automatically(&changed_files);
 
         let mut body = format!(
             "## Signing event `{branch}`\n\n{}\n",
-            markdown(&status, &config.storage)?
+            markdown(&status, store.as_ref())
         );
         let waiting: Vec<_> = status.waiting_for().into_iter().collect();
         body.push_str(&if !status.complete() {
@@ -267,8 +270,8 @@ async fn report_failure(github: &GitHub) -> Result<()> {
 }
 
 /// The signing status as markdown for the pull request, linking target files to their uploads
-/// in `storage`.
-fn markdown(status: &EventStatus, storage: &str) -> Result<String> {
+/// in `store`.
+fn markdown(status: &EventStatus, store: &dyn BlobStore) -> String {
     let mut out =
         String::from("| Role | Version | Expires | Signatures | Signed by | Waiting for |\n");
     out.push_str("|---|---|---|---|---|---|\n");
@@ -313,7 +316,7 @@ fn markdown(status: &EventStatus, storage: &str) -> Result<String> {
                 } => writeln!(
                     out,
                     "- target [`{path}`](<{}>) {kind} ({} bytes, sha256 `{}`)",
-                    public_url(storage, &file.object)?,
+                    store.public_url(&file.object),
                     file.length,
                     file.sha256
                 ),
@@ -326,7 +329,7 @@ fn markdown(status: &EventStatus, storage: &str) -> Result<String> {
             };
         }
     }
-    Ok(out)
+    out
 }
 
 /// The version and expiry columns: what main has, and what the event changes them to.

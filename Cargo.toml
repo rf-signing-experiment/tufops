@@ -37,3 +37,6 @@ walkdir = "2"
 x509-cert = "0.2"
 yubikey = "0.8"
 zeroize = "1"
+
+[profile.release]
+lto = "thin"

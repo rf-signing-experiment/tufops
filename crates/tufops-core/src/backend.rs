@@ -28,4 +28,7 @@ pub trait BlobStore: Send + Sync {
 
     /// Uploads a local file as an object that never changes once written.
     async fn put_file(&self, name: &str, path: &Path) -> Result<()>;
+
+    /// The public HTTPS URL clients download object `name` from.
+    fn public_url(&self, name: &str) -> String;
 }

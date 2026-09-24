@@ -12,6 +12,7 @@ use google_cloud_storage::client::{Storage, StorageControl};
 use sha2::{Digest as _, Sha256};
 use tuf::crypto::{KeyType, PublicKey, SignatureScheme};
 use tufops_core::backend::{BlobStore, Signer};
+use url::Url;
 
 /// An `EC_SIGN_P256_SHA256` Cloud KMS key version.
 pub struct KmsSigner {
@@ -63,6 +64,8 @@ pub struct Gcs {
     control: StorageControl,
     bucket: String,
     prefix: String,
+    /// Public URL of the objects under `prefix`.
+    public: Url,
 }
 
 impl Gcs {
@@ -71,6 +74,7 @@ impl Gcs {
         let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
         let prefix = prefix.trim_matches('/');
         Ok(Self {
+            public: public_base(bucket, prefix)?,
             storage: Storage::builder().build().await?,
             control: StorageControl::builder().build().await?,
             bucket: format!("projects/_/buckets/{bucket}"),
@@ -81,6 +85,19 @@ impl Gcs {
             },
         })
     }
+}
+
+/// The public URL of `bucket`'s objects under `prefix`.
+fn public_base(bucket: &str, prefix: &str) -> Result<Url> {
+    let mut url = Url::parse("https://storage.googleapis.com/")?;
+    extend_path(&mut url, std::iter::once(bucket).chain(prefix.split('/')));
+    Ok(url)
+}
+
+/// Appends path segments to `url`, percent-encoding each and skipping empty ones.
+fn extend_path<'a>(url: &mut Url, segments: impl Iterator<Item = &'a str>) {
+    let mut path = url.path_segments_mut().expect("https URLs have paths");
+    path.extend(segments.filter(|s| !s.is_empty()));
 }
 
 #[async_trait]
@@ -142,5 +159,11 @@ impl BlobStore for Gcs {
             .send_unbuffered()
             .await?;
         Ok(())
+    }
+
+    fn public_url(&self, name: &str) -> String {
+        let mut url = self.public.clone();
+        extend_path(&mut url, name.split('/'));
+        url.into()
     }
 }
