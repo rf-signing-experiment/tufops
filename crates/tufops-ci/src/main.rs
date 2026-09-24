@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
             if let Some(event) = branch.strip_prefix(SIGN_PREFIX) {
                 signing_event(&github, &cli.repo, event).await
             } else if branch == MAIN {
-                main_branch(&github, &cli.repo).await
+                main_branch(&cli.repo).await
             } else {
                 bail!("tufops runs on {MAIN} and {SIGN_PREFIX}* branches, not {branch}")
             }
@@ -203,7 +203,7 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
 
 /// Signs new online role versions that are due, publishes, and starts a signing event for
 /// offline roles in their signing period.
-async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
+async fn main_branch(dir: &Path) -> Result<()> {
     let git = Git::new(dir);
     let config = Config::load(dir)?;
     // The config before the latest change to main, which the current metadata was built from.

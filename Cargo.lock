@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "tufops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3745,7 +3745,7 @@ dependencies = [
 
 [[package]]
 name = "tufops-ci"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "tufops-cloud"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3775,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "tufops-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
