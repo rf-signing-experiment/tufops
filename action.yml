@@ -46,8 +46,8 @@ runs:
       env:
         # Set by the release process (see MANUAL.md): pinning this action pins the binary.
         TUFOPS_REPO: rf-signing-experiment/tufops
-        TUFOPS_VERSION: 0.1.0
-        TUFOPS_SHA256: 7eaf81b060caf15656dc4eafa0af4799be470730551bc0df57989c7d45697e0e
+        TUFOPS_VERSION: 0.2.0
+        TUFOPS_SHA256: dab591b72c91fc7ad007918b862f2ee554bf231563ef1189799f700d3c580cbd
       run: |
         url="https://github.com/$TUFOPS_REPO/releases/download/v$TUFOPS_VERSION/tufops-ci-x86_64-unknown-linux-gnu"
         curl --fail --silent --show-error --location --output "$RUNNER_TEMP/tufops-ci" "$url"
