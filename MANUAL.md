@@ -293,7 +293,7 @@ jobs:
   tufops:
     runs-on: ubuntu-latest
     steps:
-      - uses: OWNER/tufops@<commit sha> # v0.1.0
+      - uses: rf-signing-experiment/tufops@<commit sha> # v0.1.0
         with:
           app-client-id: ${{ vars.TUFOPS_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.TUFOPS_APP_PRIVATE_KEY }}
