@@ -7,8 +7,13 @@ use std::sync::Mutex;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, SubsecRound, Utc};
+use tuf::client::{Client, Config as ClientConfig};
 use tuf::crypto::{EcdsaPrivateKey, HashAlgorithm, PrivateKey, PublicKey, SignatureScheme};
-use tuf::metadata::{TargetDescription, TargetPath};
+use tuf::metadata::{
+    MetadataPath, MetadataVersion, RawSignedMetadata, TargetDescription, TargetPath,
+};
+use tuf::pouf::Pouf1;
+use tuf::repository::{EphemeralRepository, RepositoryStorage};
 use tufops_core::backend::{BlobStore, Signer};
 use tufops_core::publish::{self, target_object};
 use tufops_core::{Config, EventStatus, Repo};
@@ -282,4 +287,167 @@ async fn life_cycle() {
         .apply_config(&config, None, &main, now + Duration::days(310))
         .unwrap();
     assert_eq!(changed, ["root", "targets", "nightly"]);
+}
+
+/// A repository signed by one online key, delegating each `(role, path)`.
+fn delegating_config(key: &TestKey, delegations: &[(&str, &str)]) -> Result<Config> {
+    let role = |name: &str, paths: &str| {
+        format!(
+            "[roles.{name}]\nkeys = [\"online\"]\nthreshold = 1\nexpires_days = 30\n\
+             signing_days = 7\n{paths}\n"
+        )
+    };
+    let mut text = [
+        "storage = \"gs://bucket\"\n[keys.online]\nonline = \"gcpkms:k\"\n".to_owned(),
+        format!("public_key = \"\"\"{}\"\"\"\n", key.pem()),
+        ["root", "targets", "snapshot", "timestamp"]
+            .map(|r| role(r, ""))
+            .concat(),
+    ]
+    .concat();
+    for (name, path) in delegations {
+        text += &role(name, &format!("paths = [\"{path}\"]"));
+    }
+    Config::parse(&text)
+}
+
+/// Publishes `repo`, then looks up `paths` with rust-tuf's client, the way TUF clients do.
+async fn client_finds(repo: &Repo, store: &MemStore, paths: &[&str]) -> Vec<bool> {
+    publish::publish(repo, store).await.unwrap();
+    let remote = EphemeralRepository::<Pouf1>::new();
+    let objects = store.0.lock().unwrap().clone();
+    for (name, data) in objects {
+        let Some(file) = name
+            .strip_prefix("metadata/")
+            .and_then(|f| f.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let (version, role) = match file.split_once('.') {
+            Some((v, role)) => (MetadataVersion::Number(v.parse().unwrap()), role),
+            None => (MetadataVersion::None, file),
+        };
+        let path = MetadataPath::new(role.to_owned()).unwrap();
+        remote
+            .store_metadata(&path, version, &mut &data[..])
+            .await
+            .unwrap();
+    }
+    let root = RawSignedMetadata::new(repo.root_history().unwrap()[0].to_vec());
+    let local = EphemeralRepository::new();
+    let mut client = Client::with_trusted_root(ClientConfig::default(), &root, local, remote)
+        .await
+        .unwrap();
+    client.update().await.unwrap();
+    let mut found = vec![];
+    for path in paths {
+        let path = TargetPath::new(*path).unwrap();
+        found.push(client.fetch_target_description(&path).await.is_ok());
+    }
+    found
+}
+
+#[tokio::test]
+async fn delegated_paths() {
+    let key = TestKey::new();
+    let now = Utc::now();
+    let store = MemStore::default();
+    let target = |path: &str| {
+        let desc = TargetDescription::from_slice(path.as_bytes(), &[HashAlgorithm::Sha256]);
+        (TargetPath::new(path).unwrap(), desc.unwrap())
+    };
+    let publish = async |repo: &mut Repo, config: &Config| {
+        repo.update_online(config, None, now).unwrap();
+        let roles: Vec<_> = repo.roles().map(str::to_owned).collect();
+        sign_all(repo, &Repo::default(), &roles, &[&key]).await;
+    };
+    let changes = |status: &EventStatus, role: &str| -> Vec<String> {
+        let role = status.roles.iter().find(|r| r.role == role).unwrap();
+        role.changes.iter().map(|c| c.to_string()).collect()
+    };
+    let paths = ["a/x", "b/y", "b/one/p", "b/two/q", "z"];
+
+    // Each target goes in the role its path belongs in, and clients find them all.
+    let config = delegating_config(&key, &[("alpha", "a/"), ("beta", "b/")]).unwrap();
+    let mut repo = Repo::default();
+    repo.apply_config(&config, None, &Repo::default(), now)
+        .unwrap();
+    let files: Vec<_> = paths.map(target).into();
+    for (path, desc) in &files {
+        store
+            .put(&target_object(path, desc).unwrap(), vec![])
+            .await
+            .unwrap();
+    }
+    let changed = repo
+        .add_targets(&config, &repo.clone(), files, now)
+        .unwrap();
+    assert_eq!(changed, ["alpha", "beta", "targets"]);
+    publish(&mut repo, &config).await;
+    assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
+
+    // Moving alpha from a/ to c/ moves a/x to the top-level targets, where clients still find it.
+    let config = delegating_config(&key, &[("alpha", "c/"), ("beta", "b/")]).unwrap();
+    let main = repo.clone();
+    let changed = repo.apply_config(&config, None, &main, now).unwrap();
+    assert_eq!(changed, ["targets", "alpha"]);
+    let status = EventStatus::new(&config, &main, &repo).unwrap();
+    assert!(
+        changes(&status, "targets").contains(&"1 target moved here unchanged from alpha".into())
+    );
+    assert_eq!(
+        changes(&status, "alpha"),
+        ["1 target moved unchanged to targets"]
+    );
+    publish(&mut repo, &config).await;
+    assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
+
+    // Delegating a path moves the targets under it out of the top-level targets.
+    let config = delegating_config(&key, &[("alpha", "z"), ("beta", "b/")]).unwrap();
+    let main = repo.clone();
+    assert_eq!(
+        repo.apply_config(&config, None, &main, now).unwrap(),
+        ["targets", "alpha"]
+    );
+    assert_eq!(
+        repo.role_for_target(&TargetPath::new("z").unwrap())
+            .unwrap(),
+        "alpha"
+    );
+    publish(&mut repo, &config).await;
+    assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
+
+    // Replacing beta with two roles that split its paths moves its targets into them, and what
+    // neither covers into the top-level targets: none are lost.
+    let split = [
+        ("alpha", "z"),
+        ("beta-one", "b/one/"),
+        ("beta-two", "b/two/"),
+    ];
+    let config = delegating_config(&key, &split).unwrap();
+    let main = repo.clone();
+    let changed = repo.apply_config(&config, None, &main, now).unwrap();
+    assert_eq!(changed, ["beta", "targets", "beta-one", "beta-two"]);
+    let status = EventStatus::new(&config, &main, &repo).unwrap();
+    assert_eq!(
+        changes(&status, "beta-one"),
+        ["1 target moved here unchanged from beta"]
+    );
+    assert!(changes(&status, "targets").contains(&"delegation beta removed".into()));
+    assert!(
+        changes(&status, "targets").contains(&"1 target moved here unchanged from beta".into())
+    );
+    publish(&mut repo, &config).await;
+    assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
+
+    // Paths that more than one role covers are rejected; a mere common prefix is fine.
+    for overlapping in ["b/", "b/sub/", "b/file"] {
+        let err = delegating_config(&key, &[("alpha", overlapping), ("beta", "b/")]);
+        let err = err.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("overlap"),
+            "{overlapping}: {err:#}"
+        );
+    }
+    delegating_config(&key, &[("alpha", "bb/"), ("beta", "b/")]).unwrap();
 }

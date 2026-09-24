@@ -191,6 +191,10 @@ able to push to a protected `main`.
      update) with a bypass.
    * **Bypass list**: add the tufops App (**Always allow**), so CI can push `snapshot` and
      `timestamp` and merge signing events.
+6. Under **Settings → General → Pull Requests**, turn on **Automatically delete head
+   branches**, so a merged signing event's branch goes away and the next event with the same
+   name starts afresh. CI also deletes `sign/*` branches whose pull request was merged, in case
+   the setting is off.
 
 Security notes:
 
@@ -335,7 +339,8 @@ tufops add --from ./build/out/ --to nightly/2026-09-23/        # a whole directo
 `add`:
 
 1. Checks out the signing event (by default `sign/add-<to>`; pass `--event` to pick one, or to
-   add several things to one event). An existing event on the remote is continued.
+   add several things to one event). An existing event on the remote is continued (see
+   below).
 2. Hashes each file and uploads it to `targets/<dir>/<sha256>.<name>` in the bucket. Clients
    can't see it until metadata that lists it is published.
 3. Adds each file to the role whose `paths` match it, or to `targets` if none match.
@@ -353,6 +358,15 @@ working.
 If an upload or signature fails, tufops shows the error and asks whether to **try again** or
 **give up**. You can fix the problem (log in to `gcloud`, re-plug the YubiKey) and continue
 without starting over. Nothing is pushed until the end.
+
+**Continuing and restarting events.** When `add`, `apply` or `sign` picks up an event that
+already exists on the remote, it first merges the current `main` into it, so every change
+builds on the latest metadata. If that merge conflicts, the event is stale: usually it was
+merged already, or it was abandoned. Nothing is checked out, and tufops tells you to either:
+
+* pick a new event name with `--event`, or
+* pass `--restart` to `add` or `apply` to start the event over from `main`. This replaces the
+  event on the remote and discards its earlier changes and signatures.
 
 ## 5. Signing with a YubiKey
 
@@ -405,8 +419,17 @@ metadata and `tufops.toml`) and pushes like `add`. Typical changes:
 
 * **Add or replace a signer**: add their key under `[keys]` and list it in the roles.
 * **Change a threshold**: edit `threshold`.
-* **New delegated role**: add a `[roles.<name>]` with `paths`.
-* **Remove a delegated role**: delete its section. Its targets go with it.
+* **New delegated role**: add a `[roles.<name>]` with `paths`. Existing targets under those
+  paths, including ones in the top-level `targets`, move into the new role.
+* **Change a role's paths, or split, rename or remove a role**: edit `paths`, or replace or
+  delete the role's section. Targets are never dropped: each moves to the role that now covers
+  its path, or to the top-level `targets` if none does, so clients keep finding it. For
+  example, replacing `channels` (`channels/`) with `channels-stable` (`channels/stable/`) and
+  `channels-nightly` (`channels/nightly/`) moves its targets into those two, and anything else
+  under `channels/` into `targets`. The status summarizes moves per pair of roles, as in
+  "3612 targets moved here unchanged from channels". Only targets whose content changes are
+  listed individually. The keys of every role gaining or losing targets must sign. There is no
+  command to remove targets yet.
 * **Rotate the online key**: create a new KMS key version and change `online` and `public_key`.
 * **Change how long a role is valid**: edit its `expires_days`. `apply` compares it with the
   committed `tufops.toml` and gives the role a new version that expires `expires_days` from now.
@@ -442,7 +465,9 @@ On every push to `main`, the scheduled runs and manual runs, CI:
    been uploaded.
 3. Uploads only the metadata objects that are missing or differ, comparing MD5 digests with
    the bucket. `timestamp.json` goes last.
-4. Starts `sign/refresh` if offline roles are due.
+4. Deletes `sign/*` branches whose pull request was merged, unless they have gained commits
+   since.
+5. Starts `sign/refresh` if offline roles are due.
 
 If a run fails, CI opens an issue titled "tufops automation failed", or comments on the one
 already open.
@@ -469,10 +494,15 @@ tufops publish           # verify and upload
 | `keys`, `threshold` | Which keys sign the role, and how many signatures it needs. |
 | `expires_days` | How long each new version is valid. Changing it (with `tufops apply`) starts a new version with the new expiry, which must be signed. |
 | `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. Changing it needs no signatures. |
-| `paths` | Delegated roles only: target paths delegated from `targets`. A path ending in `/` covers everything under it. |
+| `paths` | Delegated roles only: target paths delegated from `targets`. A path ending in `/` covers everything under it; any other path covers just that file. Paths must not start with `/`. |
 
-Delegations are terminating, and clients try them in alphabetical order of role name. Keep
-their `paths` from overlapping.
+Delegations are terminating, and clients try them in alphabetical order of role name, stopping
+at the first whose paths cover the target. Since that order can't be chosen, each path may
+belong to only one role: `tufops.toml` is rejected if one role's path equals or falls under
+another's (for example `fw/` and `fw/beta/`). `fw/` and `fwx/` don't overlap.
+
+Clients must match paths the same way: rust-tuf does. Clients that treat paths as shell-style
+patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everything under it.
 
 ### CLI
 
@@ -480,8 +510,8 @@ their `paths` from overlapping.
 |---|---|
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
-| `tufops add --from PATH --to PATH [--event NAME]` | Upload artifacts and add them in a signing event. |
-| `tufops apply [--event NAME]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
+| `tufops add --from PATH --to PATH [--event NAME] [--restart]` | Upload artifacts and add them in a signing event. |
+| `tufops apply [--event NAME] [--restart]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
 | `tufops online [--push]` | On `main`: sign new online role versions that are due. |
 | `tufops publish` | Verify the checkout and upload changed metadata. |
 | `tufops pubkey [--online URI]` | Print the YubiKey's or a KMS key's public key. |

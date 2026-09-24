@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
             if let Some(event) = branch.strip_prefix(SIGN_PREFIX) {
                 signing_event(&github, &cli.repo, event).await
             } else if branch == MAIN {
-                main_branch(&cli.repo).await
+                main_branch(&github, &cli.repo).await
             } else {
                 bail!("tufops runs on {MAIN} and {SIGN_PREFIX}* branches, not {branch}")
             }
@@ -151,7 +151,10 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         git.fetch()?;
         git.run(&["checkout", "--quiet", "-B", &branch, &tip])?;
         git.run(&["merge", "--no-edit", &main]).with_context(|| {
-            format!("{branch} conflicts with {MAIN}; start it again from {MAIN}")
+            format!(
+                "{branch} conflicts with {MAIN}: start it over with --restart, for example \
+                 `tufops apply --event {event} --restart`"
+            )
         })?;
         let changed_files = git.changed_files(&main)?;
         if changed_files.is_empty() {
@@ -200,14 +203,14 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
 
 /// Signs new online role versions that are due, publishes, and starts a signing event for
 /// offline roles in their signing period.
-async fn main_branch(dir: &Path) -> Result<()> {
+async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     let git = Git::new(dir);
     let config = Config::load(dir)?;
     // The config before the latest change to main, which the current metadata was built from.
     let previous = Config::load_rev(&git, "HEAD^").ok();
     let changed = tufops_cloud::update_online(&config, previous.as_ref(), dir).await?;
     if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])?
-        && let Err(err) = git.push(MAIN)
+        && let Err(err) = git.push(MAIN, false)
     {
         // If main moved on, the run for the newer commit does this work instead.
         git.fetch()?;
@@ -230,13 +233,13 @@ async fn main_branch(dir: &Path) -> Result<()> {
     let mut head = repo.clone();
     let expiring = head.apply_config(&config, previous.as_ref(), &repo, Utc::now())?;
     if !expiring.is_empty() {
-        let branch = git.checkout_event(REFRESH_EVENT)?;
+        let branch = git.checkout_event(REFRESH_EVENT, false)?;
         head.save(dir)?;
         git.commit(
             &format!("Start new versions of {}", expiring.join(", ")),
             &[METADATA],
         )?;
-        git.push(&branch)?;
+        git.push(&branch, false)?;
         println!("Started {branch} for {expiring:?}; its workflow run opens the pull request");
     }
     Ok(())
@@ -305,9 +308,20 @@ fn markdown(status: &EventStatus, store: &dyn BlobStore) -> String {
             );
         }
     }
+    // GitHub rejects descriptions over 65536 characters; leave room for the text around this.
+    const LIMIT: usize = 30_000;
+    let total: usize = status.roles.iter().map(|r| r.changes.len()).sum();
+    let mut shown = 0;
     for role in status.roles.iter().filter(|r| !r.changes.is_empty()) {
+        if out.len() > LIMIT {
+            break;
+        }
         let _ = writeln!(out, "\n**Changes to {}**\n", role.role);
         for change in &role.changes {
+            if out.len() > LIMIT {
+                break;
+            }
+            shown += 1;
             let _ = match change {
                 Change::Target {
                     path,
@@ -328,6 +342,13 @@ fn markdown(status: &EventStatus, store: &dyn BlobStore) -> String {
                 Change::Other(text) => writeln!(out, "- {text}"),
             };
         }
+    }
+    if shown < total {
+        let _ = writeln!(
+            out,
+            "\n…and {} more changes: run `tufops status` for the full list.",
+            total - shown
+        );
     }
     out
 }

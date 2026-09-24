@@ -317,7 +317,10 @@ impl Repo {
     /// Brings root, targets and the delegated roles in line with `config`, and starts a new
     /// version of any of them in its signing period. `previous` is the config the current
     /// metadata was built from; roles whose `expires_days` differ from it get a new version too.
-    /// Returns the roles that changed.
+    ///
+    /// Every target moves to the role its path belongs in under the new delegations, so changing
+    /// a role's paths, or replacing it with other roles, moves its targets rather than leaving
+    /// them where clients no longer look or dropping them. Returns the roles that changed.
     pub fn apply_config(
         &mut self,
         config: &Config,
@@ -330,9 +333,28 @@ impl Repo {
         if self.update(base, "root", root, now, root_builder(config)?)? {
             changed.push("root".to_owned());
         }
-        let targets = self.metadata::<TargetsMetadata>("targets")?;
-        let map = targets.map(|t| t.targets().clone()).unwrap_or_default();
-        let build = targets_builder(map, config_delegations(config)?);
+
+        let delegations = config_delegations(config)?;
+        let mut targets: HashMap<String, HashMap<TargetPath, TargetDescription>> = HashMap::new();
+        for role in self.targets_roles() {
+            let listed = self.require::<TargetsMetadata>(&role)?;
+            if role != "targets" && !config.roles.contains_key(&role) {
+                self.files.remove(&file(&role));
+                changed.push(role.clone());
+            }
+            for (path, desc) in listed.targets() {
+                let dest_role = delegated_role(&delegations, path);
+                // Should a path somehow be listed twice, the role it belongs in keeps its entry.
+                let stays = dest_role == role;
+                let dest = targets.entry(dest_role).or_default();
+                if stays || !dest.contains_key(path) {
+                    dest.insert(path.clone(), desc.clone());
+                }
+            }
+        }
+
+        let map = targets.remove("targets").unwrap_or_default();
+        let build = targets_builder(map, delegations);
         if self.update(
             base,
             "targets",
@@ -342,15 +364,8 @@ impl Repo {
         )? {
             changed.push("targets".to_owned());
         }
-        for role in self.targets_roles() {
-            if role != "targets" && !config.roles.contains_key(&role) {
-                self.files.remove(&file(&role));
-                changed.push(role);
-            }
-        }
         for (role, role_config) in config.delegations() {
-            let targets = self.metadata::<TargetsMetadata>(role)?;
-            let map = targets.map(|t| t.targets().clone()).unwrap_or_default();
+            let map = targets.remove(role).unwrap_or_default();
             let build = targets_builder(map, Delegations::default());
             if self.update(base, role, (role_config, previous), now, build)? {
                 changed.push(role.clone());
@@ -361,13 +376,7 @@ impl Repo {
 
     /// The role that `path` belongs in: the first delegation whose paths match, else `targets`.
     pub fn role_for_target(&self, path: &TargetPath) -> Result<String> {
-        let targets = self.targets()?;
-        let found = targets
-            .delegations()
-            .roles()
-            .iter()
-            .find(|d| path.matches_chain(&[d.paths().clone()]));
-        Ok(found.map_or("targets", |d| d.name().as_str()).to_owned())
+        Ok(delegated_role(self.targets()?.delegations(), path))
     }
 
     /// Adds or replaces targets, in the roles their paths belong in. Returns the roles changed.
@@ -460,6 +469,14 @@ impl Repo {
         }
         Ok(changed)
     }
+}
+
+/// The role `path` belongs in under `delegations`: the first whose paths match, the way clients
+/// search them, else `targets`.
+fn delegated_role(delegations: &Delegations, path: &TargetPath) -> String {
+    let mut roles = delegations.roles().iter();
+    let found = roles.find(|d| path.matches_chain(&[d.paths().clone()]));
+    found.map_or("targets", |d| d.name().as_str()).to_owned()
 }
 
 /// Adds the keys of `role` to `keys`, returning the role's threshold and key ids.

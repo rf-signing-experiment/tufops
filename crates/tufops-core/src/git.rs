@@ -106,10 +106,13 @@ impl Git {
             .success())
     }
 
-    /// Checks out signing event `event`, continuing it from the remote if it exists there and
-    /// starting it from the remote main branch otherwise. Uncommitted edits to `tufops.toml` are
-    /// carried along; uncommitted metadata is not allowed.
-    pub fn checkout_event(&self, event: &str) -> Result<String> {
+    /// Checks out signing event `event`. An event on the remote is continued, with the remote
+    /// main branch merged into it so that edits build on the current metadata; if that merge
+    /// conflicts, the event is stale (merged or abandoned) and this fails. An event not on the
+    /// remote, or any event with `restart`, starts from the remote main branch, and pushing it
+    /// replaces whatever the remote held. Uncommitted edits to `tufops.toml` are carried along;
+    /// uncommitted metadata is not allowed.
+    pub fn checkout_event(&self, event: &str, restart: bool) -> Result<String> {
         ensure!(
             self.is_clean(&[METADATA])?,
             "{METADATA}/ has uncommitted changes"
@@ -119,21 +122,35 @@ impl Git {
         let remote = Self::remote_ref(&branch);
         let main = Self::remote_ref(MAIN);
         let local = self.rev_exists(&format!("refs/heads/{branch}"))?;
-        if self.rev_exists(&remote)? {
-            if local {
-                self.run(&["checkout", "--quiet", &branch])?;
-                self.run(&["merge", "--quiet", "--ff-only", &remote])?;
-            } else {
-                self.run(&["checkout", "--quiet", "-b", &branch, &remote])?;
-            }
-        } else {
+        if restart || !self.rev_exists(&remote)? {
             // A local branch left over from an event that has since been merged starts afresh.
             let merged = self.output(&["merge-base", "--is-ancestor", &branch, &main])?;
             ensure!(
-                !local || merged.status.success(),
-                "{branch} has commits that are not on {REMOTE}: push or delete it first"
+                restart || !local || merged.status.success(),
+                "{branch} has commits that are not on {REMOTE}: push it, or pass --restart to \
+                 discard them"
             );
             self.run(&["checkout", "--quiet", "-B", &branch, &main])?;
+            return Ok(branch);
+        }
+        // Check the merge before touching the working tree, which may hold tufops.toml edits.
+        let stale = format!(
+            "{branch} conflicts with {MAIN}, so it was probably merged or abandoned: use another \
+             event name, or pass --restart to start it over from {MAIN}, discarding its changes \
+             and signatures"
+        );
+        let merge = self.output(&["merge-tree", "--write-tree", &remote, &main])?;
+        ensure!(merge.status.success(), "{stale}");
+        if local {
+            self.run(&["checkout", "--quiet", &branch])?;
+            self.run(&["merge", "--quiet", "--ff-only", &remote])?;
+        } else {
+            self.run(&["checkout", "--quiet", "-b", &branch, &remote])?;
+        }
+        let message = format!("Merge {MAIN} into {branch}");
+        if let Err(err) = self.run(&["merge", "--quiet", "--no-edit", "-m", &message, &main]) {
+            let _ = self.run(&["merge", "--abort"]);
+            return Err(err.context(stale));
         }
         Ok(branch)
     }
@@ -149,13 +166,16 @@ impl Git {
         Ok(true)
     }
 
-    pub fn push(&self, branch: &str) -> Result<()> {
-        self.run(&[
-            "push",
-            "--quiet",
-            REMOTE,
-            &format!("HEAD:refs/heads/{branch}"),
-        ])
-        .map(drop)
+    /// Pushes `HEAD` to `branch` on the remote. With `replace`, it overwrites the branch even if
+    /// that discards commits, as long as the branch hasn't changed since the last fetch.
+    pub fn push(&self, branch: &str, replace: bool) -> Result<()> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        let force = if replace {
+            "--force-with-lease"
+        } else {
+            "--no-force"
+        };
+        self.run(&["push", "--quiet", force, REMOTE, &refspec])
+            .map(drop)
     }
 }

@@ -55,11 +55,17 @@ enum Command {
         /// Signing event to add to; defaults to one named after `--to`.
         #[arg(long)]
         event: Option<String>,
+        /// Start the event over from main, discarding its earlier changes and signatures.
+        #[arg(long)]
+        restart: bool,
     },
     /// Update the metadata to match tufops.toml, in a signing event.
     Apply {
         #[arg(long, default_value = "config")]
         event: String,
+        /// Start the event over from main, discarding its earlier changes and signatures.
+        #[arg(long)]
+        restart: bool,
     },
     /// Start and sign new snapshot and timestamp versions on main if due (normally done by CI).
     Online {
@@ -84,9 +90,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Status => status(dir),
         Command::Sign { events } => sign(dir, events).await,
-        Command::Add { from, to, event } => add(dir, &from, &to, event).await,
-        Command::Apply { event } => {
-            let mut ev = Event::open(dir, &event)?;
+        Command::Add {
+            from,
+            to,
+            event,
+            restart,
+        } => add(dir, &from, &to, event, restart).await,
+        Command::Apply { event, restart } => {
+            let mut ev = Event::open(dir, &event, restart)?;
             // Uncommitted edits to tufops.toml are what is being applied; the committed config is
             // what the metadata was built from.
             let previous = Config::load_rev(&ev.git, "HEAD").ok();
@@ -107,7 +118,7 @@ async fn main() -> Result<()> {
                 println!("Signed new versions of {}.", changed.join(", "));
             }
             if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])? && push {
-                git.push(MAIN)?;
+                git.push(MAIN, false)?;
                 println!("Pushed {MAIN}.");
             }
             Ok(())
@@ -161,12 +172,17 @@ struct Event {
     /// The remote main branch the event will be merged into.
     base: Repo,
     head: Repo,
+    /// Whether the event started over, so pushing it replaces the remote branch.
+    restart: bool,
 }
 
 impl Event {
-    fn open(dir: &Path, name: &str) -> Result<Self> {
+    fn open(dir: &Path, name: &str, restart: bool) -> Result<Self> {
         let git = Git::new(dir);
-        let branch = git.checkout_event(name)?;
+        let branch = git.checkout_event(name, restart)?;
+        if restart {
+            println!("Starting {branch} over from {MAIN}.");
+        }
         let base = Repo::load_rev(&git, &Git::remote_ref(MAIN))?;
         Ok(Self {
             branch,
@@ -174,6 +190,7 @@ impl Event {
             base,
             head: Repo::load(dir)?,
             git,
+            restart,
         })
     }
 
@@ -257,14 +274,16 @@ impl Event {
     fn finish(self, message: &str, paths: &[&str]) -> Result<()> {
         self.head.save(self.git.dir())?;
         let committed = self.git.commit(message, paths)?;
-        if committed {
-            self.git.push(&self.branch)?;
+        if committed || self.restart {
+            self.git.push(&self.branch, self.restart)?;
         }
         let status = self.status()?;
         println!();
         ui::print_event(&self.branch, &status);
         println!();
-        if committed {
+        if self.restart {
+            println!("Pushed {}, replacing the earlier event.", self.branch);
+        } else if committed {
             println!("Pushed {}.", self.branch);
         } else {
             println!("Nothing new to push.");
@@ -346,7 +365,7 @@ async fn sign(dir: &Path, mut events: Vec<String>) -> Result<()> {
     }
 
     for event in events {
-        let mut ev = Event::open(dir, &event)?;
+        let mut ev = Event::open(dir, &event, false)?;
         if ev.sign_offline(&yubikey).await? {
             let message = format!("Sign with {}", ev.config.describe_key(&me));
             ev.finish(&message, &[METADATA])?;
@@ -390,7 +409,13 @@ fn collect_files(from: &Path, to: &str) -> Result<Vec<(TargetPath, PathBuf)>> {
     Ok(files)
 }
 
-async fn add(dir: &Path, from: &Path, to: &str, event: Option<String>) -> Result<()> {
+async fn add(
+    dir: &Path,
+    from: &Path,
+    to: &str,
+    event: Option<String>,
+    restart: bool,
+) -> Result<()> {
     let files = collect_files(from, to)?;
     let slug: String = to
         .trim_matches('/')
@@ -403,7 +428,8 @@ async fn add(dir: &Path, from: &Path, to: &str, event: Option<String>) -> Result
             }
         })
         .collect();
-    let mut ev = Event::open(dir, &event.unwrap_or_else(|| format!("add-{slug}")))?;
+    let event = event.unwrap_or_else(|| format!("add-{slug}"));
+    let mut ev = Event::open(dir, &event, restart)?;
     let store = open_store(&ev.config.storage).await?;
 
     let mut targets = vec![];

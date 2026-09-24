@@ -118,6 +118,21 @@ impl Config {
                 TargetPath::new(path.clone()).with_context(|| format!("role {name}: path"))?;
             }
         }
+        // Clients stop at the first delegation covering a target, and delegations are always in
+        // alphabetical order, so each path may belong to one role only.
+        let paths: Vec<_> = self
+            .delegations()
+            .flat_map(|(role, conf)| conf.paths.iter().map(move |path| (role, path)))
+            .collect();
+        let covers = |dir: &str, path: &str| dir.ends_with('/') && path.starts_with(dir);
+        for (i, (a, p)) in paths.iter().enumerate() {
+            for (b, q) in &paths[i + 1..] {
+                ensure!(
+                    a == b || !(p == q || covers(p, q) || covers(q, p)),
+                    "roles {a} ({p}) and {b} ({q}) overlap: each path may belong to one role only"
+                );
+            }
+        }
         Ok(())
     }
 

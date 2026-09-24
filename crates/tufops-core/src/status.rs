@@ -114,6 +114,7 @@ pub struct EventStatus {
 impl EventStatus {
     /// Compares `head` with `base` (the main branch) and checks the signatures in `head`.
     pub fn new(config: &Config, base: &Repo, head: &Repo) -> Result<Self> {
+        let (base_index, head_index) = (index_targets(base)?, index_targets(head)?);
         let keys = config.keys_by_id()?;
         let key = |k: &PublicKey| Key {
             id: k.key_id().clone(),
@@ -147,7 +148,7 @@ impl EventStatus {
             }
             let (version, expires) = head.header(role)?.context("vanished")?;
             let changes = if changed {
-                changes(config, base, head, role)?
+                changes(config, (base, &base_index), (head, &head_index), role)?
             } else {
                 vec![]
             };
@@ -210,7 +211,31 @@ fn short(id: &KeyId) -> &str {
 }
 
 /// Describes how `role` in `head` differs from `base`, from the metadata that gets signed.
-fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<Change>> {
+/// Every role listing each target path, with the description it gives.
+type TargetIndex = HashMap<TargetPath, Vec<(String, TargetDescription)>>;
+
+fn index_targets(repo: &Repo) -> Result<TargetIndex> {
+    let mut index = TargetIndex::new();
+    for role in repo.targets_roles() {
+        let targets = repo
+            .metadata::<TargetsMetadata>(&role)?
+            .context("vanished")?;
+        for (path, desc) in targets.targets() {
+            index
+                .entry(path.clone())
+                .or_default()
+                .push((role.clone(), desc.clone()));
+        }
+    }
+    Ok(index)
+}
+
+fn changes(
+    config: &Config,
+    (base, base_index): (&Repo, &TargetIndex),
+    (head, head_index): (&Repo, &TargetIndex),
+    role: &str,
+) -> Result<Vec<Change>> {
     let mut out = vec![];
     if role == "root" {
         let new = head.root()?;
@@ -296,11 +321,30 @@ fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<
                 object,
             }))
         };
+        // Another role listing the same file: where it moved from, or to, unchanged.
+        let other = |index: &TargetIndex, path: &TargetPath, d: &TargetDescription| {
+            let holders = index.get(path)?;
+            let found = holders.iter().find(|(r, desc)| r != role && desc == d);
+            found.map(|(r, _)| r.clone())
+        };
+        let (mut moved_in, mut moved_out) = (BTreeMap::new(), BTreeMap::new());
         let paths: BTreeSet<_> = old_targets.keys().chain(new.targets().keys()).collect();
         for path in paths {
             let (kind, file) = match (old_targets.get(path), new.targets().get(path)) {
-                (None, Some(d)) => ("added", file(path, d)?),
-                (Some(_), None) => ("removed", None),
+                (None, Some(d)) => match other(base_index, path, d) {
+                    Some(from) => {
+                        *moved_in.entry(from).or_insert(0) += 1;
+                        continue;
+                    }
+                    None => ("added", file(path, d)?),
+                },
+                (Some(d), None) => match other(head_index, path, d) {
+                    Some(to) => {
+                        *moved_out.entry(to).or_insert(0) += 1;
+                        continue;
+                    }
+                    None => ("removed", None),
+                },
                 (Some(a), Some(b)) if a != b => ("changed", file(path, b)?),
                 _ => continue,
             };
@@ -309,6 +353,25 @@ fn changes(config: &Config, base: &Repo, head: &Repo, role: &str) -> Result<Vec<
                 kind,
                 file,
             });
+        }
+        let targets = |n: usize| {
+            if n == 1 {
+                "1 target".to_owned()
+            } else {
+                format!("{n} targets")
+            }
+        };
+        for (from, n) in moved_in {
+            out.push(Change::Other(format!(
+                "{} moved here unchanged from {from}",
+                targets(n)
+            )));
+        }
+        for (to, n) in moved_out {
+            out.push(Change::Other(format!(
+                "{} moved unchanged to {to}",
+                targets(n)
+            )));
         }
     }
 
