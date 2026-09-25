@@ -88,7 +88,7 @@ fn choose() -> Result<u32> {
             );
             let names: Vec<_> = found.iter().map(|(_, name)| name).collect();
             let chosen = Select::new()
-                .with_prompt("Which YubiKey?")
+                .with_prompt("Which YubiKey should be used?")
                 .items(&names)
                 .default(0)
                 .interact()?;

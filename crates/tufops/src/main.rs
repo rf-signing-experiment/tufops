@@ -260,7 +260,7 @@ impl Event {
         let mut signed = false;
         for (role, version) in needed {
             loop {
-                println!("Signing {role} version {version}: touch your YubiKey when it blinks.");
+                println!("Signing {role} version {version}: touch your YubiKey if needed.");
                 match self.head.sign(&role, yubikey).await {
                     Ok(()) => signed = true,
                     Err(err) if try_again(&err)? => {
