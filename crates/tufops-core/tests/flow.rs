@@ -183,6 +183,7 @@ async fn life_cycle() {
     let store = MemStore::default();
     let uploaded = publish::publish(&main, &store).await.unwrap();
     assert_eq!(uploaded.last().unwrap(), "metadata/timestamp.json");
+    assert!(uploaded.contains(&"index.html".to_owned()));
     assert!(
         publish::publish(&main, &store).await.unwrap().is_empty(),
         "nothing changed"

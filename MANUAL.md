@@ -80,12 +80,15 @@ A signing event is a `sign/<name>` branch that changes metadata. It goes through
 └── .github/workflows/tufops.yml
 
 gs://<bucket>/<prefix>/
+├── index.html                    summary page (see below)
 ├── metadata/N.root.json, N.targets.json, N.<role>.json, N.snapshot.json, timestamp.json
 └── targets/<dir>/<sha256>.<file name>     artifacts (consistent snapshots)
 ```
 
 TUF clients use `https://storage.googleapis.com/<bucket>/<prefix>/metadata/` as the metadata URL
 and `.../targets/` as the targets URL. They trust `1.root.json`, which you ship with them.
+
+People can browse the repository at `https://storage.googleapis.com/<bucket>/<prefix>/index.html`.
 
 ## 2. Installing the CLI
 
@@ -476,7 +479,8 @@ On every push to `main`, the scheduled runs and manual runs, CI:
    snapshot, targets and delegations, including expiry. It also checks that every target has
    been uploaded.
 3. Uploads only the metadata objects that are missing or differ, comparing MD5 digests with
-   the bucket. `timestamp.json` goes last.
+   the bucket. `timestamp.json` goes last. The summary page `index.html` is uploaded the same
+   way, so only when a new tufops version changes it.
 4. Deletes `sign/*` branches whose pull request was merged, unless they have gained commits
    since.
 5. Starts `sign/refresh` if offline roles are due.

@@ -141,6 +141,8 @@ impl BlobStore for Gcs {
         .set_cache_control("no-cache")
         .set_content_type(if name.ends_with(".json") {
             "application/json"
+        } else if name.ends_with(".html") {
+            "text/html; charset=utf-8"
         } else {
             "application/octet-stream"
         })

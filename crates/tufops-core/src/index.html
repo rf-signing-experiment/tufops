@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<!--
+  A summary of the TUF repository this page is published with. It reads the published metadata
+  in the browser, so it never needs regenerating, but it does not verify signatures: TUF clients
+  do that. `tufops publish` uploads it next to `metadata/` and `targets/`.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TUF repository</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --text: #1f2328; --muted: #59636e; --line: #d1d9e0; --accent: #0969da; --bad: #cf222e;
+    --bg: #ffffff; --panel: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text: #e6edf3; --muted: #9198a1; --line: #3d444d; --accent: #4493f8; --bad: #f85149;
+      --bg: #0d1117; --panel: #151b23;
+    }
+  }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.15rem; margin: 2rem 0 .75rem; }
+  p { margin: .25rem 0; }
+  .muted { color: var(--muted); }
+  .bad { color: var(--bad); }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { font-weight: 600; white-space: nowrap; }
+  .num { text-align: right; white-space: nowrap; }
+  code { font: .85rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  details { border: 1px solid var(--line); border-radius: 6px; margin: .5rem 0; }
+  summary { cursor: pointer; padding: .5rem .75rem; background: var(--panel); border-radius: 6px; }
+  details[open] summary { border-bottom: 1px solid var(--line); border-radius: 6px 6px 0 0; }
+  details table { font-size: .85rem; }
+  details td:first-child { word-break: break-all; }
+  input[type=search] { width: 100%; max-width: 26rem; box-sizing: border-box; font: inherit;
+                       padding: .45rem .7rem; border: 1px solid var(--line); border-radius: 6px;
+                       background: var(--bg); color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <h1>TUF repository</h1>
+  <p class="muted" id="status">Loading…</p>
+
+  <section id="roles" hidden>
+    <h2>Roles</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>Role</th><th>Version</th><th>Expires</th><th>Signatures</th><th>Keys</th>
+          <th>Delegated paths</th><th class="num">Targets</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="targets" hidden>
+    <h2>Targets</h2>
+    <input type="search" placeholder="Filter by path" aria-label="Filter targets by path">
+    <div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// Reads `metadata/<name>`, returning its signed part.
+async function get(name) {
+  const response = await fetch(`metadata/${name}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+  return (await response.json()).signed;
+}
+
+// Nothing refers to the newest root, so find it: double the version until one is missing, then
+// narrow down between the last that exists and the first that doesn't.
+async function latestRoot() {
+  const exists = async (v) =>
+    (await fetch(`metadata/${v}.root.json`, { method: "HEAD", cache: "no-store" })).ok;
+  let [low, high] = [1, 2];
+  while (await exists(high)) [low, high] = [high, high * 2];
+  while (high - low > 1) {
+    const mid = Math.floor((low + high) / 2);
+    if (await exists(mid)) low = mid; else high = mid;
+  }
+  return get(`${low}.root.json`);
+}
+
+function el(tag, text, props = {}) {
+  const node = Object.assign(document.createElement(tag), props);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+const date = (iso) => iso.replace("T", " ").replace("Z", " UTC");
+
+function size(bytes) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) [bytes, i] = [bytes / 1024, i + 1];
+  return i ? `${bytes.toFixed(1)} ${units[i]}` : `${bytes} B`;
+}
+
+// With consistent snapshots, a target is stored as targets/<dir>/<sha256>.<file name>.
+function targetUrl(path, sha256) {
+  const parts = path.split("/");
+  parts.push(`${sha256}.${parts.pop()}`);
+  return "targets/" + parts.map(encodeURIComponent).join("/");
+}
+
+function rolesTable(rows) {
+  const body = document.querySelector("#roles tbody");
+  for (const { name, meta, definition, count } of rows) {
+    const expired = new Date(meta.expires) < new Date();
+    const keys = el("td");
+    for (const id of definition.keyids) keys.append(el("code", id.slice(0, 8), { title: id }), " ");
+    // Timestamp is the one role published without its version in the file name.
+    const file = name === "timestamp" ? "timestamp.json" : `${meta.version}.${name}.json`;
+    const role = el("td");
+    role.append(el("a", name, { href: `metadata/${encodeURIComponent(file)}` }));
+    const tr = el("tr");
+    tr.append(
+      role,
+      el("td", meta.version),
+      el("td", date(meta.expires) + (expired ? " (expired)" : ""), expired ? { className: "bad" } : {}),
+      el("td", `${definition.threshold} of ${definition.keyids.length}`),
+      keys,
+      el("td", (definition.paths ?? []).join(", ") || "–"),
+      el("td", count ?? "–", { className: "num" }),
+    );
+    body.append(tr);
+  }
+  document.getElementById("roles").hidden = false;
+}
+
+function targetsSections(roles) {
+  const section = document.getElementById("targets");
+  const container = section.querySelector("div");
+  const groups = [];
+  for (const [name, meta] of roles) {
+    const paths = Object.keys(meta.targets ?? {}).sort();
+    if (paths.length === 0) continue;
+    const details = el("details", undefined, { open: paths.length <= 100 });
+    const summary = el("summary");
+    const count = el("span", "", { className: "muted" });
+    summary.append(el("strong", name), " ", count);
+    const body = el("tbody");
+    const rows = paths.map((path) => {
+      const target = meta.targets[path];
+      const sha256 = target.hashes.sha256;
+      const name = path.split("/").pop();
+      const link = el("a", path, { href: targetUrl(path, sha256), download: name });
+      const tr = el("tr");
+      tr.append(el("td"), el("td", size(target.length), { className: "num" }), el("td"));
+      tr.cells[0].append(link);
+      tr.cells[2].append(el("code", sha256.slice(0, 16) + "…", { title: sha256 }));
+      body.append(tr);
+      return { path: path.toLowerCase(), tr };
+    });
+    const table = el("table");
+    table.append(el("thead"), body);
+    table.tHead.innerHTML = '<tr><th>Path</th><th class="num">Size</th><th>SHA-256</th></tr>';
+    details.append(summary, el("div", undefined, { className: "scroll" }));
+    details.lastChild.append(table);
+    container.append(details);
+    groups.push({ details, count, rows, total: paths.length });
+  }
+
+  const filter = section.querySelector("input");
+  const apply = () => {
+    const query = filter.value.trim().toLowerCase();
+    for (const group of groups) {
+      let shown = 0;
+      for (const row of group.rows) {
+        row.tr.hidden = !row.path.includes(query);
+        if (!row.tr.hidden) shown++;
+      }
+      const targets = (n) => (n === 1 ? "1 target" : `${n} targets`);
+      group.count.textContent = query ? `${shown} of ${targets(group.total)}` : targets(group.total);
+      group.details.hidden = shown === 0;
+      if (query) group.details.open = true;
+    }
+  };
+  filter.addEventListener("input", apply);
+  apply();
+  section.hidden = groups.length === 0;
+}
+
+async function main() {
+  const timestamp = await get("timestamp.json");
+  const snapshotVersion = timestamp.meta["snapshot.json"].version;
+  const [root, snapshot] = await Promise.all([latestRoot(), get(`${snapshotVersion}.snapshot.json`)]);
+
+  // Every targets role, at the version the snapshot lists.
+  const names = Object.keys(snapshot.meta).map((file) => file.replace(/\.json$/, ""));
+  const loaded = await Promise.all(
+    names.map((name) => get(`${snapshot.meta[name + ".json"].version}.${name}.json`)));
+  const targets = new Map(names.map((name, i) => [name, loaded[i]]));
+  const top = targets.get("targets");
+  const delegations = top.delegations?.roles ?? [];
+  const count = (name) => Object.keys(targets.get(name)?.targets ?? {}).length;
+
+  const origin = location.href.replace(/[^/]*$/, "");
+  document.getElementById("status").textContent =
+    `${origin} · timestamp version ${timestamp.version}, expires ${date(timestamp.expires)}`;
+
+  rolesTable([
+    { name: "root", meta: root, definition: root.roles.root },
+    { name: "timestamp", meta: timestamp, definition: root.roles.timestamp },
+    { name: "snapshot", meta: snapshot, definition: root.roles.snapshot },
+    { name: "targets", meta: top, definition: root.roles.targets, count: count("targets") },
+    ...delegations.map((d) => ({ name: d.name, meta: targets.get(d.name), definition: d, count: count(d.name) })),
+  ]);
+  targetsSections([["targets", top], ...delegations.map((d) => [d.name, targets.get(d.name)])]);
+}
+
+main().catch((error) => {
+  const status = document.getElementById("status");
+  status.textContent = `Could not read the repository: ${error.message}`;
+  status.className = "bad";
+});
+</script>
+</body>
+</html>

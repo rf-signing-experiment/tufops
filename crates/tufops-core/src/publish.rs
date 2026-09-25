@@ -17,6 +17,9 @@ use crate::repo::Repo;
 
 pub const METADATA_PREFIX: &str = "metadata/";
 pub const TARGETS_PREFIX: &str = "targets/";
+/// A web page summarizing the repository, published next to `metadata/` and `targets/`. It reads
+/// the metadata in the browser, so it only changes with tufops itself.
+pub const INDEX_PAGE: &str = "index.html";
 
 /// Object name of a target file: consistent snapshots prefix the file name with its SHA-256.
 pub fn target_object(path: &TargetPath, desc: &TargetDescription) -> Result<String> {
@@ -87,7 +90,8 @@ fn metadata_objects(repo: &Repo) -> Result<BTreeMap<String, Vec<u8>>> {
 }
 
 /// Verifies the repository, checks every target file has been uploaded, then uploads the
-/// metadata objects that are missing or differ, timestamp last. Returns the objects uploaded.
+/// metadata objects and the summary page that are missing or differ, timestamp last. Returns the
+/// objects uploaded.
 pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> {
     verify(repo)?;
 
@@ -105,8 +109,11 @@ pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> 
         }
     }
 
-    let published = store.list(METADATA_PREFIX).await?;
-    let mut changed: Vec<_> = metadata_objects(repo)?
+    let mut published = store.list(METADATA_PREFIX).await?;
+    published.extend(store.list(INDEX_PAGE).await?);
+    let mut objects = metadata_objects(repo)?;
+    objects.insert(INDEX_PAGE.to_owned(), include_bytes!("index.html").to_vec());
+    let mut changed: Vec<_> = objects
         .into_iter()
         .filter(|(name, data)| {
             published
