@@ -11,7 +11,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use console::style;
 use dialoguer::{Confirm, MultiSelect, Password, Select};
-use futures_util::io::AllowStdIo;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use tuf::crypto::HashAlgorithm;
 use tuf::metadata::{TargetDescription, TargetPath};
 use tufops_cloud::{open_signer, open_store, sign_online};
@@ -428,6 +428,9 @@ fn collect_files(from: &Path, to: &str) -> Result<Vec<(TargetPath, PathBuf)>> {
     Ok(files)
 }
 
+/// How many files `add` uploads at once.
+const PARALLEL_UPLOADS: usize = 6;
+
 async fn add(
     dir: &Path,
     from: &Path,
@@ -440,19 +443,23 @@ async fn add(
     let mut ev = Event::open(dir, &event, restart)?;
     let store = open_store(&ev.config.storage).await?;
 
-    let mut targets = vec![];
-    for (path, file) in files {
-        let reader = AllowStdIo::new(
-            std::fs::File::open(&file).with_context(|| format!("opening {file:?}"))?,
-        );
-        let desc = TargetDescription::from_reader(reader, &[HashAlgorithm::Sha256]).await?;
-        let object = target_object(&path, &desc)?;
-        println!("Uploading {} as {object}", file.display());
-        while let Err(err) = store.put_file(&object, &file).await {
-            ensure!(try_again(&err)?, "upload failed");
-        }
-        targets.push((path, desc));
-    }
+    let store = store.as_ref();
+    let targets: Vec<_> = stream::iter(files)
+        .map(|(path, file)| async move {
+            let data = tokio::fs::read(&file)
+                .await
+                .with_context(|| format!("reading {file:?}"))?;
+            let desc = TargetDescription::from_slice(&data, &[HashAlgorithm::Sha256])?;
+            let object = target_object(&path, &desc)?;
+            println!("Uploading {} as {object}", file.display());
+            while let Err(err) = store.put_file(&object, &file).await {
+                ensure!(try_again(&err)?, "upload failed");
+            }
+            anyhow::Ok((path, desc))
+        })
+        .buffer_unordered(PARALLEL_UPLOADS)
+        .try_collect()
+        .await?;
     let changed = ev
         .head
         .add_targets(&ev.config, &ev.base, targets, Utc::now())?;

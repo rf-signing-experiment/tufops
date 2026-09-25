@@ -18,7 +18,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 console = "0.16"
 dialoguer = "0.12"
-futures-util = { version = "0.3", features = ["io"] }
+futures-util = "0.3"
 google-cloud-kms-v1 = "1"
 google-cloud-storage = "1"
 md-5 = "0.10"
