@@ -31,6 +31,9 @@ struct Cli {
     /// The repository's git checkout.
     #[arg(long, global = true, default_value = ".")]
     repo: PathBuf,
+    /// Serial number of the YubiKey to use, when several are plugged in.
+    #[arg(long, global = true)]
+    device: Option<u32>,
     #[command(subcommand)]
     command: Command,
 }
@@ -99,20 +102,21 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli.repo.as_path();
+    let device = cli.device;
     match cli.command {
         Command::Status => status(dir),
-        Command::Sign { events } => sign(dir, events).await,
+        Command::Sign { events } => sign(dir, events, device).await,
         Command::Add {
             from,
             to,
             event,
             restart,
-        } => add(dir, &from, &to, event, restart).await,
+        } => add(dir, &from, &to, event, restart, device).await,
         Command::Rm {
             paths,
             event,
             restart,
-        } => rm(dir, &paths, event, restart).await,
+        } => rm(dir, &paths, event, restart, device).await,
         Command::Apply { event, restart } => {
             let mut ev = Event::open(dir, &event, restart)?;
             // Uncommitted edits to tufops.toml are what is being applied; the committed config is
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
             let previous = Config::load_rev(&ev.git, "HEAD").ok();
             ev.head
                 .apply_config(&ev.config, previous.as_ref(), &ev.base, Utc::now())?;
-            ev.sign_and_finish("Apply tufops.toml", &[METADATA, CONFIG_FILE])
+            ev.sign_and_finish("Apply tufops.toml", &[METADATA, CONFIG_FILE], device)
                 .await
         }
         Command::Online { push } => {
@@ -154,7 +158,7 @@ async fn main() -> Result<()> {
         Command::Pubkey { online } => {
             let key: Box<dyn Signer> = match online {
                 Some(uri) => open_signer(&uri).await?,
-                None => Box::new(YubiKeySigner::open()?),
+                None => Box::new(YubiKeySigner::open(device)?),
             };
             print!("{}", key.public_key().to_pem()?);
             Ok(())
@@ -273,13 +277,18 @@ impl Event {
 
     /// Signs with the online keys the event needs, and with the YubiKey if one is plugged in and
     /// needed, then commits and pushes the event.
-    async fn sign_and_finish(mut self, message: &str, paths: &[&str]) -> Result<()> {
+    async fn sign_and_finish(
+        mut self,
+        message: &str,
+        paths: &[&str],
+        device: Option<u32>,
+    ) -> Result<()> {
         let roles = self.roles();
         while let Err(err) = sign_online(&self.config, &self.base, &mut self.head, &roles).await {
             ensure!(try_again(&err)?, "online signing failed");
         }
         if !self.status()?.complete() {
-            match YubiKeySigner::open() {
+            match YubiKeySigner::open(device) {
                 Ok(yubikey) => drop(self.sign_offline(&yubikey).await?),
                 Err(err) => println!("Not signing with a YubiKey: {err:#}"),
             }
@@ -349,9 +358,9 @@ fn status(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn sign(dir: &Path, mut events: Vec<String>) -> Result<()> {
+async fn sign(dir: &Path, mut events: Vec<String>, device: Option<u32>) -> Result<()> {
     let yubikey = loop {
-        match YubiKeySigner::open() {
+        match YubiKeySigner::open(device) {
             Ok(yubikey) => break yubikey,
             Err(err) => ensure!(try_again(&err)?, "no YubiKey"),
         }
@@ -437,6 +446,7 @@ async fn add(
     to: &str,
     event: Option<String>,
     restart: bool,
+    device: Option<u32>,
 ) -> Result<()> {
     let files = collect_files(from, to)?;
     let event = event.unwrap_or_else(|| format!("add-{}", slug(to)));
@@ -464,7 +474,8 @@ async fn add(
         .head
         .add_targets(&ev.config, &ev.base, targets, Utc::now())?;
     println!("Added to {}", changed.join(", "));
-    ev.sign_and_finish(&format!("Add {to}"), &[METADATA]).await
+    ev.sign_and_finish(&format!("Add {to}"), &[METADATA], device)
+        .await
 }
 
 /// `path` as part of a branch name.
@@ -474,7 +485,13 @@ fn slug(path: &str) -> String {
     chars.map(|c| if keep(c) { c } else { '-' }).collect()
 }
 
-async fn rm(dir: &Path, paths: &[String], event: Option<String>, restart: bool) -> Result<()> {
+async fn rm(
+    dir: &Path,
+    paths: &[String],
+    event: Option<String>,
+    restart: bool,
+    device: Option<u32>,
+) -> Result<()> {
     let patterns: Vec<_> = paths
         .iter()
         .map(|p| TargetPath::new(p.clone()).with_context(|| format!("target path {p}")))
@@ -486,6 +503,6 @@ async fn rm(dir: &Path, paths: &[String], event: Option<String>, restart: bool) 
         .remove_targets(&ev.config, &ev.base, &patterns, Utc::now())?;
     ensure!(removed > 0, "no targets match {}", paths.join(", "));
     println!("Removing {removed} targets from {}", changed.join(", "));
-    ev.sign_and_finish(&format!("Remove {}", paths.join(", ")), &[METADATA])
+    ev.sign_and_finish(&format!("Remove {}", paths.join(", ")), &[METADATA], device)
         .await
 }

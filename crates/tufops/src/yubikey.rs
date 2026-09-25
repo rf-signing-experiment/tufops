@@ -1,15 +1,18 @@
 //! Signing with an ECDSA P-256 key in the PIV "Digital Signature" slot (9c) of a YubiKey.
 
+use std::io::IsTerminal;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use dialoguer::Select;
 use sha2::{Digest, Sha256};
 use tuf::crypto::{PublicKey, SignatureScheme};
 use tufops_core::backend::Signer;
 use x509_cert::der::Encode;
-use yubikey::YubiKey;
 use yubikey::piv::{self, AlgorithmId, SlotId};
+use yubikey::reader::Context as Readers;
+use yubikey::{Serial, YubiKey};
 use zeroize::Zeroizing;
 
 pub struct YubiKeySigner {
@@ -19,10 +22,25 @@ pub struct YubiKeySigner {
 }
 
 impl YubiKeySigner {
-    pub fn open() -> Result<Self> {
-        let mut yubikey = YubiKey::open().context("no YubiKey found")?;
-        let metadata = piv::metadata(&mut yubikey, SlotId::Signature)
-            .context("reading PIV slot 9c (needs YubiKey firmware 5.3 or later)")?;
+    /// Opens the YubiKey with serial number `device`, or else the only one plugged in. With
+    /// several plugged in, asks which to use.
+    pub fn open(device: Option<u32>) -> Result<Self> {
+        let serial = match device {
+            Some(serial) => serial,
+            None => choose()?,
+        };
+        let mut yubikey = YubiKey::open_by_serial(Serial(serial))
+            .with_context(|| format!("no YubiKey with serial number {serial} found"))?;
+        let metadata = match piv::metadata(&mut yubikey, SlotId::Signature) {
+            Err(yubikey::Error::NotSupported) => {
+                bail!("YubiKey {serial} is too old: tufops needs firmware 5.3 or later")
+            }
+            // What the YubiKey answers when the slot is empty.
+            Err(yubikey::Error::GenericError) => {
+                bail!("YubiKey {serial} has no key in PIV slot 9c")
+            }
+            result => result.with_context(|| format!("YubiKey {serial}: reading PIV slot 9c"))?,
+        };
         let spki = metadata
             .public
             .context("PIV slot 9c has no key")?
@@ -43,6 +61,39 @@ impl YubiKeySigner {
 
     pub fn has_pin(&self) -> bool {
         self.pin.lock().unwrap().is_some()
+    }
+}
+
+/// The serial number of the YubiKey to use: the only one plugged in, or the one the user picks.
+fn choose() -> Result<u32> {
+    let mut readers = Readers::open().context("no YubiKey found")?;
+    let found: Vec<_> = readers
+        .iter()?
+        .filter_map(|reader| reader.open().ok())
+        .map(|yubikey| {
+            (
+                yubikey.serial().0,
+                format!("{} ({})", yubikey.serial(), yubikey.name()),
+            )
+        })
+        .collect();
+    match found.as_slice() {
+        [] => bail!("no YubiKey found"),
+        [(serial, _)] => Ok(*serial),
+        _ => {
+            ensure!(
+                std::io::stdin().is_terminal(),
+                "{} YubiKeys are plugged in: pick one with --device <serial number>",
+                found.len()
+            );
+            let names: Vec<_> = found.iter().map(|(_, name)| name).collect();
+            let chosen = Select::new()
+                .with_prompt("Which YubiKey?")
+                .items(&names)
+                .default(0)
+                .interact()?;
+            Ok(found[chosen].0)
+        }
     }
 }
 

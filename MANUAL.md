@@ -419,6 +419,10 @@ Choose **Give up** to skip that role. The rest of the event is still pushed.
 
 You can also name events: `tufops sign add-firmware-fw-1.2.bin`.
 
+With several YubiKeys plugged in, tufops asks which to use, or you can pick one by serial
+number with `--device` (it is printed on the key, and `ykman list --serials` shows it):
+`tufops sign --device 12345678`. `--device` works with every command that uses a YubiKey.
+
 ## 6. Changing keys and roles
 
 Edit `tufops.toml`, then run:
@@ -533,7 +537,8 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 | `tufops publish` | Verify the checkout and upload changed metadata. |
 | `tufops pubkey [--online URI]` | Print the YubiKey's or a KMS key's public key. |
 
-All commands take `--repo <path>` (default `.`).
+All commands take `--repo <path>` (default `.`) and `--device <serial number>`, the YubiKey to
+use when several are plugged in.
 
 ### Crates
 
