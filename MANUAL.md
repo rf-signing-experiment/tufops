@@ -193,11 +193,12 @@ able to push to a protected `main`.
      merging**, and **Require status checks to pass** with the check `tufops/signatures`. That
      check is what stops a pull request from being merged while signatures are missing. The
      workflow job itself succeeds whenever it did its work, even if signatures are missing.
-     Pull requests from branches other than `sign/*` never get the check, so metadata can
-     only reach `main` through signing events. Merge any other change (such as a workflow
-     update) with a bypass.
+   * Set the check's source to the tufops App instead of **Any source**. Otherwise anyone with
+     write access can set `tufops/signatures` themselves through the API. If the App isn't
+     offered yet, come back once CI has set the check on the first signing event (§3.4).
    * **Bypass list**: add the tufops App (**Always allow**), so CI can push `snapshot` and
-     `timestamp` and merge signing events.
+     `timestamp` and merge signing events. Also add whoever merges changes other than metadata,
+     for example the **Repository admin** role, with **For pull requests only**.
 7. Under **Settings → General → Pull Requests**, turn on **Automatically delete head
    branches**, so a merged signing event's branch goes away and the next event with the same
    name starts afresh. CI also deletes `sign/*` branches whose pull request was merged, in case
