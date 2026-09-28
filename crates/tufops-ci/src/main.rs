@@ -41,7 +41,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Handle the branch in `GITHUB_REF_NAME`: a signing event or main.
+    /// Handle the branch in `TUFOPS_BRANCH`: a signing event or main.
     Run,
     /// Open an issue about the failed workflow run, or comment on the one already open.
     ReportFailure,
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     let github = GitHub::from_env()?;
     match cli.command {
         Command::Run => {
-            let branch = std::env::var("GITHUB_REF_NAME").context("GITHUB_REF_NAME")?;
+            let branch = std::env::var("TUFOPS_BRANCH").context("TUFOPS_BRANCH")?;
             if let Some(event) = branch.strip_prefix(SIGN_PREFIX) {
                 signing_event(&github, &cli.repo, event).await
             } else if branch == MAIN {
@@ -253,7 +253,7 @@ async fn report_failure(github: &GitHub) -> Result<()> {
         var("GITHUB_REPOSITORY"),
         var("GITHUB_RUN_ID")
     );
-    let body = format!("tufops failed on `{}`: {run}", var("GITHUB_REF_NAME"));
+    let body = format!("tufops failed on `{}`: {run}", var("TUFOPS_BRANCH"));
     let issues = github.client.issues(&github.owner, &github.repo);
     let open = issues
         .list()

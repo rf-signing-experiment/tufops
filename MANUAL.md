@@ -77,7 +77,7 @@ A signing event is a `sign/<name>` branch that changes metadata. It goes through
 │   ├── <delegated role>.json
 │   ├── snapshot.json
 │   └── timestamp.json
-└── .github/workflows/tufops.yml
+└── .github/workflows/tufops.yml, tufops-event.yml
 
 gs://<bucket>/<prefix>/
 ├── index.html                    summary page (see below)
@@ -139,13 +139,14 @@ gcloud kms keys add-iam-policy-binding online --keyring=tufops --location=global
 gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
   --member=serviceAccount:$SA --role=roles/storage.objectAdmin
 
-# Let GitHub Actions act as the service account, but only for workflows running on main.
+# Let GitHub Actions act as the service account, but only tufops.yml on main, and only for
+# its own work on main: signing events also run tufops.yml on main, as workflow_run.
 gcloud iam workload-identity-pools create github --location=global --project=$PROJECT
 gcloud iam workload-identity-pools providers create-oidc tufops --project=$PROJECT \
   --location=global --workload-identity-pool=github \
   --issuer-uri=https://token.actions.githubusercontent.com \
   --attribute-mapping=google.subject=assertion.sub,attribute.repository=assertion.repository \
-  --attribute-condition="assertion.repository == '$REPO' && assertion.ref == 'refs/heads/main'"
+  --attribute-condition="assertion.workflow_ref == '$REPO/.github/workflows/tufops.yml@refs/heads/main' && assertion.event_name in ['push', 'schedule', 'workflow_dispatch']"
 gcloud iam service-accounts add-iam-policy-binding $SA --project=$PROJECT \
   --role=roles/iam.workloadIdentityUser \
   --member=principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/$REPO
@@ -177,13 +178,16 @@ able to push to a protected `main`.
 2. After creating it, note the **Client ID** and **Generate a private key**. Keep the `.pem`
    file safe.
 3. **Install App**, and choose **Only select repositories** → the TUF repository.
-4. In the TUF repository, go to **Settings → Secrets and variables → Actions** and add:
-   * Variable `TUFOPS_APP_CLIENT_ID`: the Client ID.
-   * Secret `TUFOPS_APP_PRIVATE_KEY`: the full contents of the `.pem` file.
-   * Variable `GCP_WORKLOAD_IDENTITY_PROVIDER`:
+4. In the TUF repository, go to **Settings → Environments → New environment**, and name it
+   `tufops`. Under **Deployment branches and tags**, choose **Selected branches and tags** and
+   add `main`. Then add the environment secret `TUFOPS_APP_PRIVATE_KEY`: the full contents of
+   the `.pem` file. Don't make it a repository secret.
+5. Under **Settings → Secrets and variables → Actions**, add the repository variables:
+   * `TUFOPS_APP_CLIENT_ID`: the Client ID.
+   * `GCP_WORKLOAD_IDENTITY_PROVIDER`:
      `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github/providers/tufops`.
-   * Variable `GCP_SERVICE_ACCOUNT`: `tufops-ci@<PROJECT>.iam.gserviceaccount.com`.
-5. Protect `main` under **Settings → Rules → Rulesets → New branch ruleset**:
+   * `GCP_SERVICE_ACCOUNT`: `tufops-ci@<PROJECT>.iam.gserviceaccount.com`.
+6. Protect `main` under **Settings → Rules → Rulesets → New branch ruleset**:
    * Target: the default branch.
    * Rules: **Restrict deletions**, **Block force pushes**, **Require a pull request before
      merging**, and **Require status checks to pass** with the check `tufops/signatures`. That
@@ -194,7 +198,7 @@ able to push to a protected `main`.
      update) with a bypass.
    * **Bypass list**: add the tufops App (**Always allow**), so CI can push `snapshot` and
      `timestamp` and merge signing events.
-6. Under **Settings → General → Pull Requests**, turn on **Automatically delete head
+7. Under **Settings → General → Pull Requests**, turn on **Automatically delete head
    branches**, so a merged signing event's branch goes away and the next event with the same
    name starts afresh. CI also deletes `sign/*` branches whose pull request was merged, in case
    the setting is off.
@@ -204,7 +208,11 @@ Security notes:
 * TUF clients verify every signature themselves. Someone who gains write access to the GitHub
   repository can't forge offline signatures. The worst they can do is delay updates. Online
   keys are a different matter: anything that can run code on `main` in CI can use them, which is
-  why the Workload Identity condition above is limited to `refs/heads/main`.
+  why the Workload Identity condition above admits only `tufops.yml`'s runs for `main`.
+* The App may push to `main`, so only main's workflow may use its key: that's what the
+  `tufops` environment enforces. A push to a `sign/*` branch runs that branch's
+  `tufops-event.yml`, which gets nothing. `tufops.yml` then handles the push, running as
+  main's version.
 * Keep write access to the TUF repository to the people who need it. Anyone with write access
   can push a `sign/*` branch, and online-only changes merge without review.
 
@@ -289,13 +297,20 @@ expires_days = 30
 signing_days = 7
 ```
 
-Then add `.github/workflows/tufops.yml`. Pin the action to a release commit:
+Then add two workflows.
+
+`.github/workflows/tufops.yml` 
 
 ```yaml
 name: tufops
 on:
   push:
-    branches: [main, "sign/**"]
+    branches: [main]
+  # Pushes to sign/* branches, signalled by tufops-event.yml.
+  workflow_run:
+    workflows: [tufops-event]
+    types: [requested]
+    branches: ["sign/**"]
   schedule:
     - cron: "17 */6 * * *"      # keeps timestamp fresh; well inside its signing_days
   workflow_dispatch:
@@ -304,15 +319,16 @@ permissions:
   contents: read
   id-token: write               # Google Workload Identity Federation
 
-concurrency:
-  group: tufops-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   tufops:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
+    environment: tufops
+    concurrency:
+      group: tufops-${{ github.event.workflow_run.head_branch || github.ref }}
+      cancel-in-progress: false
     steps:
-      - uses: rf-signing-experiment/tufops@b0cef4d026a80848cfb90b801f86181afd8ec457 # v0.1.0
+      - uses: rf-signing-experiment/tufops@0000000000000000000000000000000000000000 # vX.X.X
         with:
           app-client-id: ${{ vars.TUFOPS_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.TUFOPS_APP_PRIVATE_KEY }}
@@ -320,7 +336,24 @@ jobs:
           gcp-service-account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 ```
 
-Commit both files to `main` and push. Then create the first metadata:
+`.github/workflows/tufops-event.yml`
+
+```yaml
+name: tufops-event
+on:
+  push:
+    branches: ["sign/**"]
+
+permissions: {}
+
+jobs:
+  pushed:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+```
+
+Commit these files to `main` and push. Then create the first metadata:
 
 ```sh
 tufops apply --event init
