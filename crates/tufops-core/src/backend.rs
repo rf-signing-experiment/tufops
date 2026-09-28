@@ -23,6 +23,9 @@ pub trait BlobStore: Send + Sync {
     /// Objects whose names start with `prefix`, with the MD5 digest of each.
     async fn list(&self, prefix: &str) -> Result<HashMap<String, Vec<u8>>>;
 
+    /// The contents of object `name`, or `None` if there is no such object.
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>>;
+
     /// Writes a small object that changes over time, so it must not be cached.
     async fn put(&self, name: &str, data: Vec<u8>) -> Result<()>;
 

@@ -514,7 +514,8 @@ On every push to `main`, the scheduled runs and manual runs, CI:
    anything they describe changed. It pushes these to `main`.
 2. Verifies the whole repository as a client would, from `1.root.json` through timestamp,
    snapshot, targets and delegations, including expiry. It also checks that every target has
-   been uploaded.
+   been uploaded, and that the bucket's `timestamp.json` is not a newer version (or a different
+   one of the same version): clients that already have the newer one would reject the older.
 3. Uploads only the metadata objects that are missing or differ, comparing MD5 digests with
    the bucket. `timestamp.json` goes last. The summary page `index.html` is uploaded the same
    way, so only when a new tufops version changes it.

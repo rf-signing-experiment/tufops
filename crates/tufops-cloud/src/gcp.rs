@@ -133,6 +133,19 @@ impl BlobStore for Gcs {
         }
     }
 
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let object = format!("{}{name}", self.prefix);
+        let mut response = match self.storage.read_object(&self.bucket, object).send().await {
+            Err(err) if err.http_status_code() == Some(404) => return Ok(None),
+            response => response?,
+        };
+        let mut data = vec![];
+        while let Some(chunk) = response.next().await.transpose()? {
+            data.extend_from_slice(&chunk);
+        }
+        Ok(Some(data))
+    }
+
     async fn put(&self, name: &str, data: Vec<u8>) -> Result<()> {
         let object = format!("{}{name}", self.prefix);
         (self

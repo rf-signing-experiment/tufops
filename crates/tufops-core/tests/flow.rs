@@ -57,6 +57,10 @@ impl BlobStore for MemStore {
             .collect())
     }
 
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.lock().unwrap().get(name).cloned())
+    }
+
     async fn put(&self, name: &str, data: Vec<u8>) -> Result<()> {
         self.0.lock().unwrap().insert(name.to_owned(), data);
         Ok(())
@@ -277,12 +281,34 @@ async fn life_cycle() {
     assert!(again.is_empty());
     let config = old_config;
 
-    // Two days later the timestamp is refreshed; after ten months, offline roles need signing.
+    // Two days later the timestamp is refreshed. Once that is published, publishing never goes
+    // back to the older timestamp, nor replaces it with another of the same version.
     let later = now + Duration::days(2);
+    let refresh = async |at| {
+        let mut repo = main.clone();
+        let changed = repo.update_online(&config, None, at).unwrap();
+        assert_eq!(changed, ["timestamp"]);
+        sign_all(&mut repo, &Repo::default(), &changed, &[&online2]).await;
+        repo
+    };
+    let refreshed = refresh(later).await;
+    let diverged = refresh(later + Duration::hours(1)).await;
     assert_eq!(
-        main.clone().update_online(&config, None, later).unwrap(),
-        ["timestamp"]
+        publish::publish(&refreshed, &store).await.unwrap(),
+        ["metadata/timestamp.json"]
     );
+    for (repo, error) in [(&main, "newer than"), (&diverged, "diverged")] {
+        let err = publish::publish(repo, &store).await.unwrap_err();
+        assert!(format!("{err:#}").contains(error), "{err:#}");
+    }
+    assert!(
+        publish::publish(&refreshed, &store)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // After ten months, offline roles need signing.
     let mut head = main.clone();
     let changed = head
         .apply_config(&config, None, &main, now + Duration::days(310))

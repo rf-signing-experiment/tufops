@@ -9,6 +9,7 @@ use tuf::Database;
 use tuf::crypto::HashAlgorithm;
 use tuf::metadata::{
     Metadata, MetadataPath, RawSignedMetadata, TargetDescription, TargetPath, TargetsMetadata,
+    TimestampMetadata,
 };
 use tuf::pouf::Pouf1;
 
@@ -20,6 +21,8 @@ pub const TARGETS_PREFIX: &str = "targets/";
 /// A web page summarizing the repository, published next to `metadata/` and `targets/`. It reads
 /// the metadata in the browser, so it only changes with tufops itself.
 pub const INDEX_PAGE: &str = "index.html";
+/// The object clients start every update from.
+const TIMESTAMP: &str = "metadata/timestamp.json";
 
 /// Object name of a target file: consistent snapshots prefix the file name with its SHA-256.
 pub fn target_object(path: &TargetPath, desc: &TargetDescription) -> Result<String> {
@@ -83,17 +86,42 @@ fn metadata_objects(repo: &Repo) -> Result<BTreeMap<String, Vec<u8>>> {
         );
     }
     objects.insert(
-        format!("{METADATA_PREFIX}timestamp.json"),
+        TIMESTAMP.to_owned(),
         repo.raw("timestamp").context("no timestamp")?.to_vec(),
     );
     Ok(objects)
 }
 
-/// Verifies the repository, checks every target file has been uploaded, then uploads the
-/// metadata objects and the summary page that are missing or differ, timestamp last. Returns the
-/// objects uploaded.
+/// Checks that publishing `repo` would not replace the published timestamp with an older
+/// version, which clients that have the newer one reject as a rollback, or with a different one
+/// of the same version, which means the metadata was published from a history that diverged.
+async fn check_timestamp(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
+    let Some(published) = store.get(TIMESTAMP).await? else {
+        return Ok(());
+    };
+    let raw = RawSignedMetadata::<Pouf1, TimestampMetadata>::new(published.clone());
+    let parsed = raw.parse_untrusted().and_then(|s| s.assume_valid());
+    let published_version = parsed.context("parsing the published timestamp")?.version();
+    let (version, _) = repo.header("timestamp")?.context("no timestamp")?;
+    ensure!(
+        published_version <= version,
+        "storage has timestamp version {published_version}, newer than this repository's \
+         {version}: publish from an up-to-date checkout of main"
+    );
+    ensure!(
+        published_version < version || repo.raw("timestamp") == Some(&published[..]),
+        "storage has a timestamp version {version} that differs from this repository's: it was \
+         published from metadata that diverged from this checkout"
+    );
+    Ok(())
+}
+
+/// Verifies the repository, checks it is not older than what is published and that every target
+/// file has been uploaded, then uploads the metadata objects and the summary page that are
+/// missing or differ, timestamp last. Returns the objects uploaded.
 pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> {
     verify(repo)?;
+    check_timestamp(repo, store).await?;
 
     let uploaded = store.list(TARGETS_PREFIX).await?;
     for role in repo.targets_roles() {
@@ -122,7 +150,7 @@ pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> 
         })
         .collect();
     // Clients start from timestamp.json, so it must only refer to files already uploaded.
-    changed.sort_by_key(|(name, _)| name.ends_with("timestamp.json"));
+    changed.sort_by_key(|(name, _)| name == TIMESTAMP);
     let mut names = vec![];
     for (name, data) in changed {
         store.put(&name, data).await?;
