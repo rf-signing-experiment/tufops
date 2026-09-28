@@ -147,6 +147,22 @@ impl Config {
         self.roles.iter().filter(|(_, r)| !r.paths.is_empty())
     }
 
+    /// Whether every key of `role` is online.
+    pub fn online_only(&self, role: &str) -> bool {
+        let online = |k: &String| self.keys.get(k).is_some_and(|k| k.online.is_some());
+        self.roles
+            .get(role)
+            .is_some_and(|r| r.keys.iter().all(online))
+    }
+
+    /// Whether CI signs `role` by itself. CI holds only the keys that sign snapshot and
+    /// timestamp, so other online keys can be kept from it.
+    pub fn ci_signs(&self, role: &str) -> bool {
+        let keys = |r: &str| self.roles.get(r).map(|r| r.keys.as_slice());
+        let ci = [keys("snapshot"), keys("timestamp")].map(Option::unwrap_or_default);
+        keys(role).is_some_and(|keys| keys.iter().all(|k| ci.iter().any(|c| c.contains(k))))
+    }
+
     pub fn public_key(&self, name: &str) -> Result<PublicKey> {
         let key = self
             .keys

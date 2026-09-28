@@ -42,7 +42,9 @@ A role's keys decide how it is signed:
 | all online | Cloud KMS | automatically, by the CLI or CI |
 | any offline | people with YubiKeys | in a signing event, until the threshold is met |
 
-`snapshot` and `timestamp` must use online keys. CI signs them on `main`.
+`snapshot` and `timestamp` must use online keys. CI signs them on `main`. CI holds only their
+keys: a role signed by any other online key is signed by whoever runs the CLI with access to
+it, so you can keep, say, a release process's key away from CI (§3.1, §7).
 
 ### Signing events
 
@@ -154,7 +156,9 @@ gcloud iam service-accounts add-iam-policy-binding $SA --project=$PROJECT \
 
 People who run `tufops add` for paths signed by online keys also need
 `roles/cloudkms.signerVerifier` on the key and `roles/storage.objectAdmin` on the bucket.
-People who only add files that YubiKeys sign need just the bucket role.
+People who only add files that YubiKeys sign need just the bucket role. For an online key that
+CI must not use, create it the same way, but grant the KMS role only to those people, not to
+`$SA`.
 
 ### 3.2 GitHub App
 
@@ -504,15 +508,19 @@ signatures are in.
 Each role gets a new version, valid for `expires_days`, whenever it changes. It also gets one
 once it is within `signing_days` of expiring:
 
-* **Online roles** (timestamp, snapshot, online delegated roles): CI re-signs them on its
-  schedule and publishes.
+* **Roles CI signs** (timestamp, snapshot, and roles signed only by their keys): CI re-signs
+  them on its schedule and publishes.
+* **Other online roles**: CI opens an issue titled "tufops roles need renewing". Someone with
+  their keys runs `tufops apply --event renew`, which starts and signs the new versions, and CI
+  merges the event. `apply` renews every role that is due, so if offline roles are due too,
+  merge `sign/refresh` first.
 * **Offline roles**: CI opens a signing event called `sign/refresh` with the new versions, and
   signers sign it like any other.
 
 On every push to `main`, the scheduled runs and manual runs, CI:
 
-1. Signs new online role versions that are due, and new `snapshot` and `timestamp` versions if
-   anything they describe changed. It pushes these to `main`.
+1. Signs new versions that are due of the roles it signs, and new `snapshot` and `timestamp`
+   versions if anything they describe changed. It pushes these to `main`.
 2. Verifies the whole repository as a client would, from `1.root.json` through timestamp,
    snapshot, targets and delegations, including expiry. It also checks that every target has
    been uploaded, and that the bucket's `timestamp.json` is not a newer version (or a different
@@ -523,6 +531,8 @@ On every push to `main`, the scheduled runs and manual runs, CI:
 4. Deletes `sign/*` branches whose pull request was merged, unless they have gained commits
    since.
 5. Starts `sign/refresh` if offline roles are due.
+6. Keeps the "tufops roles need renewing" issue open while other online roles are due, and
+   closes it once they're renewed.
 
 If a run fails, CI opens an issue titled "tufops automation failed", or comments on the one
 already open.
@@ -530,7 +540,7 @@ already open.
 You can do the online steps by hand from a `main` checkout:
 
 ```sh
-tufops online --push     # sign new snapshot/timestamp versions if due
+tufops online --push     # sign new versions of the roles CI signs, if due
 tufops publish           # verify and upload
 ```
 
@@ -568,7 +578,7 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 | `tufops add --from PATH --to PATH [--event NAME] [--restart]` | Upload artifacts and add them in a signing event. |
 | `tufops rm PATH… [--event NAME] [--restart]` | Remove targets (a path ending in `/` removes everything under it) in a signing event; their uploads are kept. |
 | `tufops apply [--event NAME] [--restart]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
-| `tufops online [--push]` | On `main`: sign new online role versions that are due. |
+| `tufops online [--push]` | On `main`: sign new versions that are due of the roles CI signs. |
 | `tufops publish` | Verify the checkout and upload changed metadata. |
 | `tufops pubkey [--online URI]` | Print the YubiKey's or a KMS key's public key. |
 

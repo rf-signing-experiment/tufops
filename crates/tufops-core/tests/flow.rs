@@ -501,3 +501,54 @@ async fn delegated_paths() {
     }
     delegating_config(&key, &[("alpha", "bb/"), ("beta", "b/")]).unwrap();
 }
+
+/// A role signed by an online key that doesn't sign snapshot or timestamp: CI doesn't hold such
+/// keys, so it never starts new versions of the role, or puts it in its signing event.
+#[tokio::test]
+async fn online_key_ci_lacks() {
+    let (ci, tools) = (TestKey::new(), TestKey::new());
+    let role = |name: &str, key: &str, paths: &str| {
+        format!(
+            "[roles.{name}]\nkeys = [\"{key}\"]\nthreshold = 1\nexpires_days = 30\n\
+             signing_days = 7\n{paths}\n"
+        )
+    };
+    let config = Config::parse(&format!(
+        "storage = \"gs://bucket\"\n\
+         [keys.ci]\nonline = \"gcpkms:ci\"\npublic_key = \"\"\"{}\"\"\"\n\
+         [keys.tools]\nonline = \"gcpkms:tools\"\npublic_key = \"\"\"{}\"\"\"\n{}{}",
+        ci.pem(),
+        tools.pem(),
+        ["root", "targets", "snapshot", "timestamp"]
+            .map(|r| role(r, "ci", ""))
+            .concat(),
+        role("tools", "tools", "paths = [\"tools/\"]"),
+    ))
+    .unwrap();
+    assert!(config.ci_signs("targets") && !config.ci_signs("tools"));
+
+    let now = Utc::now();
+    let mut main = Repo::default();
+    let changed = main
+        .apply_config(&config, None, &Repo::default(), now)
+        .unwrap();
+    sign_all(&mut main, &Repo::default(), &changed, &[&ci, &tools]).await;
+    let changed = main.update_online(&config, None, now).unwrap();
+    sign_all(&mut main, &Repo::default(), &changed, &[&ci]).await;
+
+    // In their signing periods, CI starts new versions of the roles it signs, but not of tools.
+    let later = now + Duration::days(24);
+    let changed = main.update_online(&config, None, later).unwrap();
+    assert_eq!(changed, ["targets", "snapshot", "timestamp"]);
+    sign_all(&mut main, &Repo::default(), &changed, &[&ci]).await;
+
+    // Applying the config renews tools too, but CI's signing event takes only the other roles.
+    let mut head = main.clone();
+    let expiring = head.apply_config(&config, None, &main, later).unwrap();
+    assert_eq!(expiring, ["root", "tools"]);
+    let event = main.with_roles_from(&head, &["root".to_owned()]);
+    let status = EventStatus::new(&config, &main, &event).unwrap();
+    let roles: Vec<_> = status.roles.iter().map(|r| r.role.as_str()).collect();
+    assert_eq!(roles, ["root"]);
+    assert_eq!(event.root_history().unwrap().len(), 2);
+}

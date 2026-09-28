@@ -2,8 +2,8 @@
 //!
 //! On a push to a `sign/*` branch it keeps that signing event's pull request and
 //! `tufops/signatures` status up to date, and merges events only online keys sign. On main (pushes, schedule and manual runs) it signs
-//! new snapshot and timestamp versions, publishes, and starts signing events for offline roles
-//! about to expire.
+//! new snapshot and timestamp versions, publishes, starts signing events for offline roles
+//! about to expire, and opens an issue for online roles about to expire that it can't sign.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
-use octocrab::models::StatusState;
+use octocrab::models::issues::Issue;
+use octocrab::models::{IssueState, StatusState};
 use octocrab::params::State;
 use tufops_cloud::open_store;
 use tufops_core::backend::BlobStore;
@@ -25,6 +26,8 @@ use tufops_core::{Config, EventStatus, Repo};
 /// Signing event CI starts when offline roles are about to expire.
 const REFRESH_EVENT: &str = "refresh";
 const FAILURE_TITLE: &str = "tufops automation failed";
+/// Issue listing online roles about to expire that CI can't sign.
+const RENEW_TITLE: &str = "tufops roles need renewing";
 /// Commit status on signing events: make it a required check so pull requests missing
 /// signatures can't be merged.
 const STATUS_CONTEXT: &str = "tufops/signatures";
@@ -98,6 +101,21 @@ impl GitHub {
         Ok(())
     }
 
+    /// The open issue titled `title`, if any.
+    async fn open_issue(&self, title: &str) -> Result<Option<Issue>> {
+        let issues = self.client.issues(&self.owner, &self.repo);
+        let open = issues
+            .list()
+            .state(State::Open)
+            .per_page(100u8)
+            .send()
+            .await?;
+        Ok(open
+            .items
+            .into_iter()
+            .find(|i| i.title == title && i.pull_request.is_none()))
+    }
+
     /// Updates the description of the open pull request for `branch`, or creates one if `create`.
     async fn update_pr(&self, branch: &str, body: &str, create: bool) -> Result<()> {
         let pulls = self.client.pulls(&self.owner, &self.repo);
@@ -128,7 +146,7 @@ async fn main() -> Result<()> {
             if let Some(event) = branch.strip_prefix(SIGN_PREFIX) {
                 signing_event(&github, &cli.repo, event).await
             } else if branch == MAIN {
-                main_branch(&cli.repo).await
+                main_branch(&github, &cli.repo).await
             } else {
                 bail!("tufops runs on {MAIN} and {SIGN_PREFIX}* branches, not {branch}")
             }
@@ -201,9 +219,10 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
     unreachable!()
 }
 
-/// Signs new online role versions that are due, publishes, and starts a signing event for
-/// offline roles in their signing period.
-async fn main_branch(dir: &Path) -> Result<()> {
+/// Signs new versions that are due of the roles CI signs, publishes, and starts a signing event
+/// for offline roles in their signing period. Online roles in their signing period that CI can't
+/// sign are listed in an issue instead.
+async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     let git = Git::new(dir);
     let config = Config::load(dir)?;
     // The config before the latest change to main, which the current metadata was built from.
@@ -227,20 +246,48 @@ async fn main_branch(dir: &Path) -> Result<()> {
     println!("Published {} objects: {uploaded:?}", uploaded.len());
 
     git.fetch()?;
-    if git.remote_events()?.iter().any(|e| e == REFRESH_EVENT) {
-        return Ok(());
-    }
     let mut head = repo.clone();
     let expiring = head.apply_config(&config, previous.as_ref(), &repo, Utc::now())?;
-    if !expiring.is_empty() {
+    // CI renewed the online roles it signs above, so these are ones it can't sign.
+    let (online, offline): (Vec<_>, Vec<_>) =
+        expiring.into_iter().partition(|r| config.online_only(r));
+    if !offline.is_empty() && !git.remote_events()?.iter().any(|e| e == REFRESH_EVENT) {
         let branch = git.checkout_event(REFRESH_EVENT, false)?;
-        head.save(dir)?;
+        repo.with_roles_from(&head, &offline).save(dir)?;
         git.commit(
-            &format!("Start new versions of {}", expiring.join(", ")),
+            &format!("Start new versions of {}", offline.join(", ")),
             &[METADATA],
         )?;
         git.push(&branch, false)?;
-        println!("Started {branch} for {expiring:?}; its workflow run opens the pull request");
+        println!("Started {branch} for {offline:?}; its workflow run opens the pull request");
+    }
+    report_renewals(github, &repo, &online).await
+}
+
+/// Keeps an issue open listing `roles`, the online roles in their signing period that CI can't
+/// sign, and closes it once there are none.
+async fn report_renewals(github: &GitHub, repo: &Repo, roles: &[String]) -> Result<()> {
+    let issues = github.client.issues(&github.owner, &github.repo);
+    let issue = github.open_issue(RENEW_TITLE).await?;
+    if roles.is_empty() {
+        if let Some(issue) = issue {
+            let close = issues.update(issue.number).state(IssueState::Closed);
+            close.send().await?;
+        }
+        return Ok(());
+    }
+    let mut body = String::from(
+        "CI can't sign these roles. Someone with their keys must renew them before they expire, \
+         with `tufops apply --event renew`.\n\n",
+    );
+    for role in roles {
+        let (_, expires) = repo.header(role)?.context("vanished")?;
+        let _ = writeln!(body, "- `{role}` expires {}", expires.format("%Y-%m-%d"));
+    }
+    match issue {
+        Some(issue) if issue.body.as_deref() == Some(&body) => {}
+        Some(issue) => drop(issues.update(issue.number).body(&body).send().await?),
+        None => drop(issues.create(RENEW_TITLE).body(body).send().await?),
     }
     Ok(())
 }
@@ -255,17 +302,7 @@ async fn report_failure(github: &GitHub) -> Result<()> {
     );
     let body = format!("tufops failed on `{}`: {run}", var("TUFOPS_BRANCH"));
     let issues = github.client.issues(&github.owner, &github.repo);
-    let open = issues
-        .list()
-        .state(State::Open)
-        .per_page(100u8)
-        .send()
-        .await?;
-    match open
-        .items
-        .iter()
-        .find(|i| i.title == FAILURE_TITLE && i.pull_request.is_none())
-    {
+    match github.open_issue(FAILURE_TITLE).await? {
         Some(issue) => drop(issues.create_comment(issue.number, body).await?),
         None => drop(issues.create(FAILURE_TITLE).body(body).send().await?),
     }

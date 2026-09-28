@@ -435,11 +435,11 @@ impl Repo {
         Ok((changed, removed))
     }
 
-    /// Starts new versions of the roles only online keys sign: online targets roles in their
-    /// signing period, then snapshot and timestamp whenever what they describe changed or they
-    /// are in their signing period. Like `apply_config`, a changed `expires_days` since
-    /// `previous` also starts a new version. The new versions still need signing. Returns the
-    /// roles changed.
+    /// Starts new versions of the roles CI signs: targets roles signed only by snapshot's and
+    /// timestamp's keys in their signing period, then snapshot and timestamp whenever what they
+    /// describe changed or they are in their signing period. Like `apply_config`, a changed
+    /// `expires_days` since `previous` also starts a new version. The new versions still need
+    /// signing. Returns the roles changed.
     pub fn update_online(
         &mut self,
         config: &Config,
@@ -450,11 +450,7 @@ impl Repo {
         let mut changed = vec![];
         for role in self.targets_roles() {
             let role_config = config.role(&role)?;
-            if role_config
-                .keys
-                .iter()
-                .all(|k| config.keys[k].online.is_some())
-            {
+            if config.ci_signs(&role) {
                 let cur = self.require::<TargetsMetadata>(&role)?;
                 let build = targets_builder(cur.targets().clone(), cur.delegations().clone());
                 if self.update(&base, &role, (role_config, previous), now, build)? {
@@ -496,6 +492,21 @@ impl Repo {
             changed.push("timestamp".to_owned());
         }
         Ok(changed)
+    }
+
+    /// This repository with `roles` as they are in `other`, including root's history when root
+    /// is among them.
+    pub fn with_roles_from(&self, other: &Repo, roles: &[String]) -> Repo {
+        let mut repo = self.clone();
+        let taken = |f: &String| {
+            roles.iter().any(|r| *f == file(r))
+                || roles.contains(&"root".to_owned()) && f.starts_with(ROOT_HISTORY)
+        };
+        repo.files.retain(|f, _| !taken(f));
+        let files = other.files.iter().filter(|(f, _)| taken(f));
+        repo.files
+            .extend(files.map(|(f, bytes)| (f.clone(), bytes.clone())));
+        repo
     }
 }
 
