@@ -10,8 +10,8 @@ use google_cloud_kms_v1::client::KeyManagementService;
 use google_cloud_kms_v1::model::Digest;
 use google_cloud_storage::client::{Storage, StorageControl};
 use sha2::{Digest as _, Sha256};
-use tuf::crypto::{KeyType, PublicKey, SignatureScheme};
-use tufops_core::backend::{BlobStore, Signer};
+use tuf::crypto::PublicKey;
+use tufops_core::backend::{BlobStore, Signer, public_key_from_pem};
 use url::Url;
 
 /// An `EC_SIGN_P256_SHA256` Cloud KMS key version.
@@ -25,9 +25,8 @@ impl KmsSigner {
     pub async fn new(name: &str) -> Result<Self> {
         let client = KeyManagementService::builder().build().await?;
         let key = client.get_public_key().set_name(name).send().await?;
-        let public =
-            PublicKey::from_pem(&key.pem, KeyType::Ecdsa, SignatureScheme::EcdsaSha2NistP256)
-                .with_context(|| format!("{name} is not an ECDSA P-256 key"))?;
+        let public = public_key_from_pem(&key.pem)
+            .with_context(|| format!("{name} is not an ECDSA P-256 key"))?;
         Ok(Self {
             client,
             name: name.to_owned(),
@@ -73,8 +72,9 @@ impl Gcs {
     pub async fn new(path: &str) -> Result<Self> {
         let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
         let prefix = prefix.trim_matches('/');
+        let storage_url = Url::parse("https://storage.googleapis.com/")?;
         Ok(Self {
-            public: public_base(bucket, prefix)?,
+            public: with_path(storage_url, &format!("{bucket}/{prefix}")),
             storage: Storage::builder().build().await?,
             control: StorageControl::builder().build().await?,
             bucket: format!("projects/_/buckets/{bucket}"),
@@ -85,19 +85,18 @@ impl Gcs {
             },
         })
     }
+
+    /// The full name of object `name`, under the prefix.
+    fn object(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
 }
 
-/// The public URL of `bucket`'s objects under `prefix`.
-fn public_base(bucket: &str, prefix: &str) -> Result<Url> {
-    let mut url = Url::parse("https://storage.googleapis.com/")?;
-    extend_path(&mut url, std::iter::once(bucket).chain(prefix.split('/')));
-    Ok(url)
-}
-
-/// Appends path segments to `url`, percent-encoding each and skipping empty ones.
-fn extend_path<'a>(url: &mut Url, segments: impl Iterator<Item = &'a str>) {
-    let mut path = url.path_segments_mut().expect("https URLs have paths");
-    path.extend(segments.filter(|s| !s.is_empty()));
+/// `url` with the segments of `path` appended, each percent-encoded, skipping empty ones.
+fn with_path(mut url: Url, path: &str) -> Url {
+    (url.path_segments_mut().expect("https URLs have paths"))
+        .extend(path.split('/').filter(|s| !s.is_empty()));
+    url
 }
 
 #[async_trait]
@@ -108,7 +107,7 @@ impl BlobStore for Gcs {
         loop {
             let page = (self.control.list_objects())
                 .set_parent(&self.bucket)
-                .set_prefix(format!("{}{prefix}", self.prefix))
+                .set_prefix(self.object(prefix))
                 .set_page_token(token)
                 .send()
                 .await?;
@@ -134,8 +133,8 @@ impl BlobStore for Gcs {
     }
 
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let object = format!("{}{name}", self.prefix);
-        let mut response = match self.storage.read_object(&self.bucket, object).send().await {
+        let read = self.storage.read_object(&self.bucket, self.object(name));
+        let mut response = match read.send().await {
             Err(err) if err.http_status_code() == Some(404) => return Ok(None),
             response => response?,
         };
@@ -147,20 +146,18 @@ impl BlobStore for Gcs {
     }
 
     async fn put(&self, name: &str, data: Vec<u8>) -> Result<()> {
-        let object = format!("{}{name}", self.prefix);
-        (self
-            .storage
-            .write_object(&self.bucket, object, Bytes::from(data)))
-        .set_cache_control("no-cache")
-        .set_content_type(if name.ends_with(".json") {
-            "application/json"
-        } else if name.ends_with(".html") {
-            "text/html; charset=utf-8"
-        } else {
-            "application/octet-stream"
-        })
-        .send_unbuffered()
-        .await?;
+        (self.storage)
+            .write_object(&self.bucket, self.object(name), Bytes::from(data))
+            .set_cache_control("no-cache")
+            .set_content_type(if name.ends_with(".json") {
+                "application/json"
+            } else if name.ends_with(".html") {
+                "text/html; charset=utf-8"
+            } else {
+                "application/octet-stream"
+            })
+            .send_unbuffered()
+            .await?;
         Ok(())
     }
 
@@ -168,17 +165,14 @@ impl BlobStore for Gcs {
         let file = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("opening {path:?}"))?;
-        let object = format!("{}{name}", self.prefix);
         self.storage
-            .write_object(&self.bucket, object, file)
+            .write_object(&self.bucket, self.object(name), file)
             .send_unbuffered()
             .await?;
         Ok(())
     }
 
     fn public_url(&self, name: &str) -> String {
-        let mut url = self.public.clone();
-        extend_path(&mut url, name.split('/'));
-        url.into()
+        with_path(self.public.clone(), name).into()
     }
 }

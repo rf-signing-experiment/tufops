@@ -1,7 +1,7 @@
 //! The TUF metadata of a repository: loading, editing and signing it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, SubsecRound, Utc};
@@ -34,28 +34,33 @@ fn file(role: &str) -> String {
     format!("{role}.json")
 }
 
+fn history_file(version: u32) -> String {
+    format!("{ROOT_HISTORY}/{version}.root.json")
+}
+
+/// The names and paths of the `.json` files in `dir`; none if `dir` does not exist.
+fn json_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = vec![];
+    for entry in std::fs::read_dir(dir).into_iter().flatten() {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str());
+        if let Some(name) = name.filter(|n| n.ends_with(".json") && path.is_file()) {
+            files.push((name.to_owned(), path.clone()));
+        }
+    }
+    Ok(files)
+}
+
 impl Repo {
     /// Loads the metadata in a working tree.
     pub fn load(dir: &Path) -> Result<Self> {
-        let mut files = BTreeMap::new();
         let base = dir.join(METADATA);
-        for (prefix, sub) in [
-            ("", base.clone()),
-            ("root_history/", base.join(ROOT_HISTORY)),
-        ] {
-            let Ok(entries) = std::fs::read_dir(&sub) else {
-                continue;
-            };
-            for entry in entries {
-                let path = entry?.path();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .context("bad file name")?;
-                if path.is_file() && name.ends_with(".json") {
-                    files.insert(format!("{prefix}{name}"), std::fs::read(&path)?);
-                }
-            }
+        let mut files = BTreeMap::new();
+        for (name, path) in json_files(&base)? {
+            files.insert(name, std::fs::read(path)?);
+        }
+        for (name, path) in json_files(&base.join(ROOT_HISTORY))? {
+            files.insert(format!("{ROOT_HISTORY}/{name}"), std::fs::read(path)?);
         }
         Ok(Self { files })
     }
@@ -64,10 +69,8 @@ impl Repo {
     pub fn load_rev(git: &Git, rev: &str) -> Result<Self> {
         let mut files = BTreeMap::new();
         for path in git.ls(rev, METADATA)? {
-            if let Some(name) = path
-                .strip_prefix("metadata/")
-                .filter(|n| n.ends_with(".json"))
-            {
+            let name = path.strip_prefix(&format!("{METADATA}/"));
+            if let Some(name) = name.filter(|n| n.ends_with(".json")) {
                 files.insert(name.to_owned(), git.show(rev, &path)?.context("vanished")?);
             }
         }
@@ -78,14 +81,9 @@ impl Repo {
     pub fn save(&self, dir: &Path) -> Result<()> {
         let base = dir.join(METADATA);
         std::fs::create_dir_all(base.join(ROOT_HISTORY))?;
-        for entry in std::fs::read_dir(&base)? {
-            let path = entry?.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if path.is_file() && name.ends_with(".json") && !self.files.contains_key(name) {
-                std::fs::remove_file(&path)?;
+        for (name, path) in json_files(&base)? {
+            if !self.files.contains_key(&name) {
+                std::fs::remove_file(path)?;
             }
         }
         for (name, bytes) in &self.files {
@@ -108,7 +106,7 @@ impl Repo {
         let version = self.root()?.version();
         (1..=version)
             .map(|v| {
-                let name = format!("{ROOT_HISTORY}/{v}.root.json");
+                let name = history_file(v);
                 self.files
                     .get(&name)
                     .map(Vec::as_slice)
@@ -124,10 +122,7 @@ impl Repo {
         pretty.push(b'\n');
         if role == "root" {
             let version = parse_unverified::<RootMetadata>(&pretty)?.version();
-            self.files.insert(
-                format!("{ROOT_HISTORY}/{version}.root.json"),
-                pretty.clone(),
-            );
+            self.files.insert(history_file(version), pretty.clone());
         }
         self.files.insert(file(role), pretty);
         Ok(())
@@ -287,7 +282,7 @@ impl Repo {
     /// * `expires_days` differs from `previous`, the config the current metadata was built from,
     /// * or the version in `base` lacks signatures from the keys the role now has.
     ///
-    /// The new version is one more than the version in `base`. Returns whether the role changed.
+    /// The new version is one more than the version in `base`. Returns `role` if it changed.
     fn update<M: Metadata>(
         &mut self,
         base: &Repo,
@@ -296,7 +291,7 @@ impl Repo {
         previous: Option<&Config>,
         now: DateTime<Utc>,
         build: Build<M>,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let config = config.role(role)?;
         let now = now.trunc_subsecs(0);
         if let Some(cur) = self.metadata::<M>(role)? {
@@ -310,14 +305,14 @@ impl Repo {
                 && !keys_changed
                 && !config.in_signing_period(cur.expires(), now)
             {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let version = base.header(role)?.map_or(1, |(v, _)| v + 1);
         let metadata = build(version, now + Duration::days(config.expires_days))?;
         let signed = SignedMetadataBuilder::<Pouf1, M>::from_metadata(&metadata)?.build();
         self.put(role, signed.to_raw()?.as_bytes())?;
-        Ok(true)
+        Ok(Some(role.to_owned()))
     }
 
     /// Brings root, targets and the delegated roles in line with `config`, and starts a new
@@ -335,9 +330,7 @@ impl Repo {
         now: DateTime<Utc>,
     ) -> Result<Vec<String>> {
         let mut changed = vec![];
-        if self.update(base, "root", config, previous, now, root_builder(config)?)? {
-            changed.push("root".to_owned());
-        }
+        changed.extend(self.update(base, "root", config, previous, now, root_builder(config)?)?);
 
         let delegations = config_delegations(config)?;
         let mut targets: HashMap<String, HashMap<TargetPath, TargetDescription>> = HashMap::new();
@@ -360,15 +353,11 @@ impl Repo {
 
         let map = targets.remove("targets").unwrap_or_default();
         let build = targets_builder(map, delegations);
-        if self.update(base, "targets", config, previous, now, build)? {
-            changed.push("targets".to_owned());
-        }
+        changed.extend(self.update(base, "targets", config, previous, now, build)?);
         for (role, _) in config.delegations() {
             let map = targets.remove(role).unwrap_or_default();
             let build = targets_builder(map, Delegations::default());
-            if self.update(base, role, config, previous, now, build)? {
-                changed.push(role.clone());
-            }
+            changed.extend(self.update(base, role, config, previous, now, build)?);
         }
         Ok(changed)
     }
@@ -399,9 +388,7 @@ impl Repo {
             let mut map = cur.targets().clone();
             map.extend(new);
             let build = targets_builder(map, cur.delegations().clone());
-            if self.update(base, &role, config, None, now, build)? {
-                changed.push(role);
-            }
+            changed.extend(self.update(base, &role, config, None, now, build)?);
         }
         Ok(changed)
     }
@@ -427,9 +414,7 @@ impl Repo {
             }
             removed += cur.targets().len() - map.len();
             let build = targets_builder(map, cur.delegations().clone());
-            if self.update(base, &role, config, None, now, build)? {
-                changed.push(role);
-            }
+            changed.extend(self.update(base, &role, config, None, now, build)?);
         }
         Ok((changed, removed))
     }
@@ -451,9 +436,7 @@ impl Repo {
             if config.ci_signs(&role) {
                 let cur = self.require::<TargetsMetadata>(&role)?;
                 let build = targets_builder(cur.targets().clone(), cur.delegations().clone());
-                if self.update(&base, &role, config, previous, now, build)? {
-                    changed.push(role);
-                }
+                changed.extend(self.update(&base, &role, config, previous, now, build)?);
             }
         }
 
@@ -466,17 +449,13 @@ impl Repo {
             );
         }
         let build = Box::new(move |v, e| SnapshotMetadata::new(v, e, meta.clone(), HashMap::new()));
-        if self.update(&base, "snapshot", config, previous, now, build)? {
-            changed.push("snapshot".to_owned());
-        }
+        changed.extend(self.update(&base, "snapshot", config, previous, now, build)?);
 
         let (version, _) = self.require_header("snapshot")?;
         let snapshot = MetadataDescription::new(version, None, HashMap::new())?;
         let build =
             Box::new(move |v, e| TimestampMetadata::new(v, e, snapshot.clone(), HashMap::new()));
-        if self.update(&base, "timestamp", config, previous, now, build)? {
-            changed.push("timestamp".to_owned());
-        }
+        changed.extend(self.update(&base, "timestamp", config, previous, now, build)?);
         Ok(changed)
     }
 

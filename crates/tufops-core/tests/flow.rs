@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{Duration, SubsecRound, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use tuf::client::{Client, Config as ClientConfig};
 use tuf::crypto::{EcdsaPrivateKey, HashAlgorithm, PrivateKey, PublicKey, SignatureScheme};
 use tuf::metadata::{
@@ -15,6 +15,7 @@ use tuf::metadata::{
 use tuf::pouf::Pouf1;
 use tuf::repository::{EphemeralRepository, RepositoryStorage};
 use tufops_core::backend::{BlobStore, Signer};
+use tufops_core::config::TOP_LEVEL_ROLES;
 use tufops_core::publish::{self, target_object};
 use tufops_core::{Config, EventStatus, Repo};
 
@@ -149,6 +150,18 @@ async fn sign_all(repo: &mut Repo, base: &Repo, roles: &[String], keys: &[&TestK
     }
 }
 
+/// What CI does on main: starts the new versions of online roles due `at`, signed with `key`.
+async fn ci_update(
+    repo: &mut Repo,
+    config: &Config,
+    at: DateTime<Utc>,
+    key: &TestKey,
+) -> Vec<String> {
+    let changed = repo.update_online(config, None, at).unwrap();
+    sign_all(repo, &Repo::default(), &changed, &[key]).await;
+    changed
+}
+
 #[tokio::test]
 async fn life_cycle() {
     let (alice, bob, online) = (TestKey::new(), TestKey::new(), TestKey::new());
@@ -181,9 +194,8 @@ async fn life_cycle() {
 
     // Merged into main: CI adds snapshot and timestamp, then publishes.
     let mut main = head;
-    let online_changed = main.update_online(&config, None, now).unwrap();
-    assert_eq!(online_changed, ["snapshot", "timestamp"]);
-    sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
+    let changed = ci_update(&mut main, &config, now, &online).await;
+    assert_eq!(changed, ["snapshot", "timestamp"]);
     let store = MemStore::default();
     let uploaded = publish::publish(&main, &store).await.unwrap();
     assert_eq!(uploaded.last().unwrap(), "metadata/timestamp.json");
@@ -220,8 +232,7 @@ async fn life_cycle() {
             .starts_with("target nightly/app.bin added (5 bytes, sha256 2cf24dba")
     );
     let mut main = head;
-    let online_changed = main.update_online(&config, None, now).unwrap();
-    sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
+    ci_update(&mut main, &config, now, &online).await;
     assert!(
         publish::publish(&main, &store).await.is_err(),
         "target not uploaded"
@@ -242,8 +253,7 @@ async fn life_cycle() {
     sign_all(&mut head, &main, &changed, &[&bob]).await;
     assert!(EventStatus::new(&config, &main, &head).unwrap().complete());
     let mut main = head;
-    let online_changed = main.update_online(&config, None, now).unwrap();
-    sign_all(&mut main, &Repo::default(), &online_changed, &[&online]).await;
+    ci_update(&mut main, &config, now, &online).await;
     publish::publish(&main, &store).await.unwrap();
 
     // Rotating the online key: root and targets change offline; roles the new key signs get
@@ -256,9 +266,8 @@ async fn life_cycle() {
     sign_all(&mut head, &main, &changed, &[&alice, &online2]).await;
     assert!(EventStatus::new(&config, &main, &head).unwrap().complete());
     let mut main = head;
-    let online_changed = main.update_online(&config, None, now).unwrap();
-    assert_eq!(online_changed, ["snapshot", "timestamp"]);
-    sign_all(&mut main, &Repo::default(), &online_changed, &[&online2]).await;
+    let changed = ci_update(&mut main, &config, now, &online2).await;
+    assert_eq!(changed, ["snapshot", "timestamp"]);
     publish::publish(&main, &store).await.unwrap();
 
     // Changing how long root is valid for gives root a new version with the new expiry, which
@@ -286,9 +295,8 @@ async fn life_cycle() {
     let later = now + Duration::days(2);
     let refresh = async |at| {
         let mut repo = main.clone();
-        let changed = repo.update_online(&config, None, at).unwrap();
+        let changed = ci_update(&mut repo, &config, at, &online2).await;
         assert_eq!(changed, ["timestamp"]);
-        sign_all(&mut repo, &Repo::default(), &changed, &[&online2]).await;
         repo
     };
     let refreshed = refresh(later).await;
@@ -316,24 +324,28 @@ async fn life_cycle() {
     assert_eq!(changed, ["root", "targets", "nightly"]);
 }
 
+/// Config for online key `name`.
+fn key_toml(name: &str, key: &TestKey) -> String {
+    let pem = key.pem();
+    format!("[keys.{name}]\nonline = \"gcpkms:{name}\"\npublic_key = \"\"\"{pem}\"\"\"\n")
+}
+
+/// Config for role `name`, signed by `key` alone, with `extra` settings such as its paths.
+fn role_toml(name: &str, key: &str, extra: &str) -> String {
+    format!(
+        "[roles.{name}]\nkeys = [\"{key}\"]\nthreshold = 1\nexpires_days = 30\n\
+         signing_days = 7\n{extra}\n"
+    )
+}
+
 /// A repository signed by one online key, delegating each `(role, path)`.
 fn delegating_config(key: &TestKey, delegations: &[(&str, &str)]) -> Result<Config> {
-    let role = |name: &str, paths: &str| {
-        format!(
-            "[roles.{name}]\nkeys = [\"online\"]\nthreshold = 1\nexpires_days = 30\n\
-             signing_days = 7\n{paths}\n"
-        )
-    };
-    let mut text = [
-        "storage = \"gs://bucket\"\n[keys.online]\nonline = \"gcpkms:k\"\n".to_owned(),
-        format!("public_key = \"\"\"{}\"\"\"\n", key.pem()),
-        ["root", "targets", "snapshot", "timestamp"]
-            .map(|r| role(r, ""))
-            .concat(),
-    ]
-    .concat();
+    let mut text = format!("storage = \"gs://bucket\"\n{}", key_toml("online", key));
+    for role in TOP_LEVEL_ROLES {
+        text += &role_toml(role, "online", "");
+    }
     for (name, path) in delegations {
-        text += &role(name, &format!("paths = [\"{path}\"]"));
+        text += &role_toml(name, "online", &format!("paths = [\"{path}\"]"));
     }
     Config::parse(&text)
 }
@@ -507,24 +519,16 @@ async fn delegated_paths() {
 #[tokio::test]
 async fn online_key_ci_lacks() {
     let (ci, tools) = (TestKey::new(), TestKey::new());
-    let role = |name: &str, key: &str, paths: &str| {
-        format!(
-            "[roles.{name}]\nkeys = [\"{key}\"]\nthreshold = 1\nexpires_days = 30\n\
-             signing_days = 7\n{paths}\n"
-        )
-    };
-    let config = Config::parse(&format!(
-        "storage = \"gs://bucket\"\n\
-         [keys.ci]\nonline = \"gcpkms:ci\"\npublic_key = \"\"\"{}\"\"\"\n\
-         [keys.tools]\nonline = \"gcpkms:tools\"\npublic_key = \"\"\"{}\"\"\"\n{}{}",
-        ci.pem(),
-        tools.pem(),
-        ["root", "targets", "snapshot", "timestamp"]
-            .map(|r| role(r, "ci", ""))
-            .concat(),
-        role("tools", "tools", "paths = [\"tools/\"]"),
-    ))
-    .unwrap();
+    let mut text = format!(
+        "storage = \"gs://bucket\"\n{}{}",
+        key_toml("ci", &ci),
+        key_toml("tools", &tools)
+    );
+    for role in TOP_LEVEL_ROLES {
+        text += &role_toml(role, "ci", "");
+    }
+    text += &role_toml("tools", "tools", "paths = [\"tools/\"]");
+    let config = Config::parse(&text).unwrap();
     assert!(config.ci_signs("targets") && !config.ci_signs("tools"));
 
     let now = Utc::now();
@@ -533,14 +537,12 @@ async fn online_key_ci_lacks() {
         .apply_config(&config, None, &Repo::default(), now)
         .unwrap();
     sign_all(&mut main, &Repo::default(), &changed, &[&ci, &tools]).await;
-    let changed = main.update_online(&config, None, now).unwrap();
-    sign_all(&mut main, &Repo::default(), &changed, &[&ci]).await;
+    ci_update(&mut main, &config, now, &ci).await;
 
     // In their signing periods, CI starts new versions of the roles it signs, but not of tools.
     let later = now + Duration::days(24);
-    let changed = main.update_online(&config, None, later).unwrap();
+    let changed = ci_update(&mut main, &config, later, &ci).await;
     assert_eq!(changed, ["targets", "snapshot", "timestamp"]);
-    sign_all(&mut main, &Repo::default(), &changed, &[&ci]).await;
 
     // Applying the config renews tools too, but CI's signing event takes only the other roles.
     let mut head = main.clone();

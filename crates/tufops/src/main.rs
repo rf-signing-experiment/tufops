@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use console::style;
-use dialoguer::{Confirm, MultiSelect, Password, Select};
+use dialoguer::{Confirm, MultiSelect, Select};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tuf::crypto::HashAlgorithm;
 use tuf::metadata::{TargetDescription, TargetPath};
@@ -56,32 +56,21 @@ enum Command {
         /// Target path in the repository; a directory when it ends in `/` or `--from` is one.
         #[arg(long)]
         to: String,
-        /// Signing event to add to; defaults to one named after `--to`.
-        #[arg(long)]
-        event: Option<String>,
-        /// Start the event over from main, discarding its earlier changes and signatures.
-        #[arg(long)]
-        restart: bool,
+        #[command(flatten)]
+        event: EventArgs,
     },
     /// Remove artifacts from the repository in a signing event; their uploads are kept.
     Rm {
         /// Target paths to remove; a path ending in `/` removes everything under it.
         #[arg(required = true)]
         paths: Vec<String>,
-        /// Signing event to remove in; defaults to one named after the first path.
-        #[arg(long)]
-        event: Option<String>,
-        /// Start the event over from main, discarding its earlier changes and signatures.
-        #[arg(long)]
-        restart: bool,
+        #[command(flatten)]
+        event: EventArgs,
     },
     /// Update the metadata to match tufops.toml, in a signing event.
     Apply {
-        #[arg(long, default_value = "config")]
-        event: String,
-        /// Start the event over from main, discarding its earlier changes and signatures.
-        #[arg(long)]
-        restart: bool,
+        #[command(flatten)]
+        event: EventArgs,
     },
     /// Start and sign new snapshot and timestamp versions on main if due (normally done by CI).
     Online {
@@ -99,6 +88,25 @@ enum Command {
     },
 }
 
+/// The signing event a command makes its change in.
+#[derive(Args)]
+struct EventArgs {
+    /// Signing event to make the change in (without `sign/`); defaults to one named after the
+    /// change.
+    #[arg(long)]
+    event: Option<String>,
+    /// Start the event over from main, discarding its earlier changes and signatures.
+    #[arg(long)]
+    restart: bool,
+}
+
+impl EventArgs {
+    /// Checks out the event, named `default` unless `--event` names one.
+    fn open(&self, dir: &Path, default: &str) -> Result<Event> {
+        Event::open(dir, self.event.as_deref().unwrap_or(default), self.restart)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -107,19 +115,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Status => status(dir),
         Command::Sign { events } => sign(dir, events, device).await,
-        Command::Add {
-            from,
-            to,
-            event,
-            restart,
-        } => add(dir, &from, &to, event, restart, device).await,
-        Command::Rm {
-            paths,
-            event,
-            restart,
-        } => rm(dir, &paths, event, restart, device).await,
-        Command::Apply { event, restart } => {
-            let mut ev = Event::open(dir, &event, restart)?;
+        Command::Add { from, to, event } => add(dir, &from, &to, event, device).await,
+        Command::Rm { paths, event } => rm(dir, &paths, event, device).await,
+        Command::Apply { event } => {
+            let mut ev = event.open(dir, "config")?;
             // Uncommitted edits to tufops.toml are what is being applied; the committed config is
             // what the metadata was built from.
             let previous = Config::load_rev(&ev.git, "HEAD").ok();
@@ -133,13 +132,13 @@ async fn main() -> Result<()> {
             ensure!(git.current_branch()? == MAIN, "check out {MAIN} first");
             let previous = Config::load_rev(&git, "HEAD^").ok();
             let config = Config::load(dir)?;
-            let changed = tufops_cloud::update_online(&config, previous.as_ref(), dir).await?;
+            let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
             if changed.is_empty() {
                 println!("Online roles are up to date.");
-            } else {
-                println!("Signed new versions of {}.", changed.join(", "));
+                return Ok(());
             }
-            if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])? && push {
+            println!("Signed new versions of {}.", changed.join(", "));
+            if push {
                 git.push(MAIN, false)?;
                 println!("Pushed {MAIN}.");
             }
@@ -181,11 +180,6 @@ fn try_again(err: &anyhow::Error) -> Result<bool> {
     Ok(choice == 0)
 }
 
-fn ask_pin(yubikey: &YubiKeySigner) -> Result<()> {
-    yubikey.set_pin(Password::new().with_prompt("YubiKey PIN").interact()?);
-    Ok(())
-}
-
 /// A signing event checked out in the working tree.
 struct Event {
     git: Git,
@@ -205,12 +199,11 @@ impl Event {
         if restart {
             println!("Starting {branch} over from {MAIN}.");
         }
-        let base = Repo::load_rev(&git, &Git::remote_ref(MAIN))?;
         Ok(Self {
-            branch,
+            base: Repo::load_rev(&git, &Git::remote_ref(MAIN))?,
             config: Config::load(dir)?,
-            base,
             head: Repo::load(dir)?,
+            branch,
             git,
             restart,
         })
@@ -248,7 +241,7 @@ impl Event {
         }
         let needed: Vec<_> = needed.iter().map(|r| (r.role.clone(), r.version)).collect();
         if !yubikey.has_pin() {
-            ask_pin(yubikey)?;
+            yubikey.ask_pin()?;
         }
         let mut signed = false;
         for (role, version) in needed {
@@ -257,7 +250,7 @@ impl Event {
                 match self.head.sign(&role, yubikey).await {
                     Ok(()) => signed = true,
                     Err(err) if try_again(&err)? => {
-                        ask_pin(yubikey)?;
+                        yubikey.ask_pin()?;
                         continue;
                     }
                     Err(_) => println!("Skipped {role}."),
@@ -308,16 +301,7 @@ impl Event {
             println!("Nothing new to push.");
         }
         let changed_files = self.git.changed_files(&Git::remote_ref(MAIN))?;
-        if !status.complete() {
-            let waiting = status.waiting_for().join(", ");
-            println!("Waiting for signatures from {waiting}. Track status via PR.");
-        } else if status.merges_automatically(&changed_files) {
-            println!("All signatures are in: this change will automatically merge");
-        } else {
-            println!(
-                "All signatures are in: this change requires a maintainer to complete the PR."
-            );
-        }
+        println!("{}", status.next_step(&changed_files));
         Ok(())
     }
 }
@@ -434,16 +418,12 @@ async fn add(
     dir: &Path,
     from: &Path,
     to: &str,
-    event: Option<String>,
-    restart: bool,
+    event: EventArgs,
     device: Option<u32>,
 ) -> Result<()> {
     let files = collect_files(from, to)?;
-    let event = event.unwrap_or_else(|| format!("add-{}", slug(to)));
-    let mut ev = Event::open(dir, &event, restart)?;
-    let store = open_store(&ev.config.storage).await?;
-
-    let store = store.as_ref();
+    let mut ev = event.open(dir, &format!("add-{}", slug(to)))?;
+    let store = &*open_store(&ev.config.storage).await?;
     let targets: Vec<_> = stream::iter(files)
         .map(|(path, file)| async move {
             let data = tokio::fs::read(&file)
@@ -475,19 +455,12 @@ fn slug(path: &str) -> String {
     chars.map(|c| if keep(c) { c } else { '-' }).collect()
 }
 
-async fn rm(
-    dir: &Path,
-    paths: &[String],
-    event: Option<String>,
-    restart: bool,
-    device: Option<u32>,
-) -> Result<()> {
+async fn rm(dir: &Path, paths: &[String], event: EventArgs, device: Option<u32>) -> Result<()> {
     let patterns: Vec<_> = paths
         .iter()
         .map(|p| TargetPath::new(p.clone()).with_context(|| format!("target path {p}")))
         .collect::<Result<_>>()?;
-    let event = event.unwrap_or_else(|| format!("rm-{}", slug(&paths[0])));
-    let mut ev = Event::open(dir, &event, restart)?;
+    let mut ev = event.open(dir, &format!("rm-{}", slug(&paths[0])))?;
     let (changed, removed) = ev
         .head
         .remove_targets(&ev.config, &ev.base, &patterns, Utc::now())?;

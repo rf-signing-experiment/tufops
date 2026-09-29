@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use tufops_core::EventStatus;
 use tufops_core::backend::BlobStore;
-use tufops_core::status::{Change, Key, Requirement, RoleStatus};
+use tufops_core::status::{Change, Requirement, RoleStatus, names};
 
 /// How long the list of changes may grow. GitHub rejects descriptions over 65536 characters, so
 /// this leaves room for the rest.
@@ -93,14 +93,5 @@ fn version(role: &RoleStatus) -> (String, String) {
             format!("{} → {}", date(&expires), date(&role.expires)),
         ),
         _ => (role.version.to_string(), date(&role.expires)),
-    }
-}
-
-fn names(keys: &[Key]) -> String {
-    let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
-    if names.is_empty() {
-        "-".to_owned()
-    } else {
-        names.join(", ")
     }
 }

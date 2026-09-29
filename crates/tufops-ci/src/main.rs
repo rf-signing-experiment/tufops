@@ -1,9 +1,10 @@
 //! `tufops-ci`: the automation the tufops GitHub action runs on a checkout of the repository.
 //!
 //! On a push to a `sign/*` branch it keeps that signing event's pull request and
-//! `tufops/signatures` status up to date, and merges events only online keys sign. On main (pushes, schedule and manual runs) it signs
-//! new snapshot and timestamp versions, publishes, starts signing events for offline roles
-//! about to expire, and opens an issue for online roles about to expire that it can't sign.
+//! `tufops/signatures` status up to date, and merges events only online keys sign. On main
+//! (pushes, schedule and manual runs) it signs new snapshot and timestamp versions, publishes,
+//! starts signing events for offline roles about to expire, and opens an issue for online roles
+//! about to expire that it can't sign.
 
 mod markdown;
 
@@ -14,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
+use octocrab::issues::IssueHandler;
 use octocrab::models::issues::Issue;
 use octocrab::models::{IssueState, StatusState};
 use octocrab::params::State;
@@ -54,38 +56,47 @@ struct GitHub {
     client: Octocrab,
     owner: String,
     repo: String,
+    /// Link to this workflow run.
+    run_url: String,
 }
 
 impl GitHub {
     fn from_env() -> Result<Self> {
-        let token = std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN")?;
-        let repository = std::env::var("GITHUB_REPOSITORY").context("GITHUB_REPOSITORY")?;
+        let var = |name| std::env::var(name).context(name);
+        let repository = var("GITHUB_REPOSITORY")?;
         let (owner, repo) = repository
             .split_once('/')
             .context("bad GITHUB_REPOSITORY")?;
-        let client = Octocrab::builder().personal_token(token).build()?;
+        let optional = |name| var(name).unwrap_or_default();
+        let (server, run) = (optional("GITHUB_SERVER_URL"), optional("GITHUB_RUN_ID"));
         Ok(Self {
-            client,
+            client: Octocrab::builder()
+                .personal_token(var("GITHUB_TOKEN")?)
+                .build()?,
             owner: owner.to_owned(),
             repo: repo.to_owned(),
+            run_url: format!("{server}/{repository}/actions/runs/{run}"),
         })
     }
 
-    /// Sets the `tufops/signatures` status of commit `sha`: pending until every signature is in.
-    async fn set_status(&self, sha: &str, status: &EventStatus) -> Result<()> {
-        let (state, description) = if status.complete() {
-            (StatusState::Success, "All signatures are in".to_owned())
+    fn issues(&self) -> IssueHandler<'_> {
+        self.client.issues(&self.owner, &self.repo)
+    }
+
+    /// Sets the `tufops/signatures` status of commit `sha` with `description`: pending until
+    /// every signature is in.
+    async fn set_status(&self, sha: &str, status: &EventStatus, description: &str) -> Result<()> {
+        let state = if status.complete() {
+            StatusState::Success
         } else {
-            let waiting = status.waiting_for().join(", ");
-            (StatusState::Pending, format!("Waiting for {waiting}"))
+            StatusState::Pending
         };
-        // GitHub limits status descriptions to 140 characters.
-        let description = description.chars().take(140).collect();
         (self.client.repos(&self.owner, &self.repo))
             .create_status(sha.to_owned(), state)
             .context(STATUS_CONTEXT.to_owned())
-            .description(description)
-            .target(run_url())
+            // GitHub limits status descriptions to 140 characters.
+            .description(description.chars().take(140).collect())
+            .target(self.run_url.clone())
             .send()
             .await?;
         Ok(())
@@ -93,8 +104,7 @@ impl GitHub {
 
     /// The open issue titled `title`, if any.
     async fn open_issue(&self, title: &str) -> Result<Option<Issue>> {
-        let issues = self.client.issues(&self.owner, &self.repo);
-        let open = issues
+        let open = (self.issues())
             .list()
             .state(State::Open)
             .per_page(100u8)
@@ -111,16 +121,50 @@ impl GitHub {
         let pulls = self.client.pulls(&self.owner, &self.repo);
         let head = format!("{}:{branch}", self.owner);
         let open = pulls.list().state(State::Open).head(head).send().await?;
+        let title = format!("Signing event {branch}");
         match open.items.first() {
             Some(pr) => drop(pulls.update(pr.number).body(body).send().await?),
-            None if create => drop(
-                pulls
-                    .create(format!("Signing event {branch}"), branch, MAIN)
-                    .body(body)
-                    .send()
-                    .await?,
-            ),
+            None if create => drop(pulls.create(title, branch, MAIN).body(body).send().await?),
             None => {}
+        }
+        Ok(())
+    }
+
+    /// Keeps an issue open listing `roles`, the online roles in their signing period that CI
+    /// can't sign, and closes it once there are none.
+    async fn report_renewals(&self, repo: &Repo, roles: &[String]) -> Result<()> {
+        let issues = self.issues();
+        let issue = self.open_issue(RENEW_TITLE).await?;
+        if roles.is_empty() {
+            if let Some(issue) = issue {
+                let close = issues.update(issue.number).state(IssueState::Closed);
+                close.send().await?;
+            }
+            return Ok(());
+        }
+        let mut body = String::from(
+            "CI can't sign these roles. Someone with their keys must renew them before they \
+             expire, with `tufops apply --event renew`.\n\n",
+        );
+        for role in roles {
+            let (_, expires) = repo.require_header(role)?;
+            let _ = writeln!(body, "- `{role}` expires {}", expires.format("%Y-%m-%d"));
+        }
+        match issue {
+            Some(issue) if issue.body.as_deref() == Some(&body) => {}
+            Some(issue) => drop(issues.update(issue.number).body(&body).send().await?),
+            None => drop(issues.create(RENEW_TITLE).body(body).send().await?),
+        }
+        Ok(())
+    }
+
+    /// Comments on the open issue about failed runs with a link to this one, or opens the issue.
+    async fn report_failure(&self, branch: &str) -> Result<()> {
+        let issues = self.issues();
+        let body = format!("tufops failed on `{branch}`: {}", self.run_url);
+        match self.open_issue(FAILURE_TITLE).await? {
+            Some(issue) => drop(issues.create_comment(issue.number, body).await?),
+            None => drop(issues.create(FAILURE_TITLE).body(body).send().await?),
         }
         Ok(())
     }
@@ -130,9 +174,10 @@ impl GitHub {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let github = GitHub::from_env()?;
+    let branch = std::env::var("TUFOPS_BRANCH").context("TUFOPS_BRANCH");
     match cli.command {
         Command::Run => {
-            let branch = std::env::var("TUFOPS_BRANCH").context("TUFOPS_BRANCH")?;
+            let branch = branch?;
             if let Some(event) = branch.strip_prefix(SIGN_PREFIX) {
                 signing_event(&github, &cli.repo, event).await
             } else if branch == MAIN {
@@ -141,7 +186,7 @@ async fn main() -> Result<()> {
                 bail!("tufops runs on {MAIN} and {SIGN_PREFIX}* branches, not {branch}")
             }
         }
-        Command::ReportFailure => report_failure(&github).await,
+        Command::ReportFailure => github.report_failure(&branch.unwrap_or_default()).await,
     }
 }
 
@@ -175,23 +220,12 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
         let merge = status.merges_automatically(&changed_files);
 
+        let next_step = status.next_step(&changed_files);
         let mut body = String::new();
         markdown::write_event(&mut body, &branch, &status, store.as_ref());
-        body.push('\n');
-        body.push_str(&if !status.complete() {
-            format!(
-                "Waiting for signatures from {}. Signers: check out the repository and run \
-                 `tufops sign`.",
-                status.waiting_for().join(", ")
-            )
-        } else if merge {
-            "All signatures are in: merging.".to_owned()
-        } else {
-            "All signatures are in: a maintainer can now review and merge this pull request."
-                .to_owned()
-        });
+        let _ = write!(body, "\n{next_step}");
         println!("{body}");
-        github.set_status(&tip, &status).await?;
+        github.set_status(&tip, &status, &next_step).await?;
         // Only events that merge straight away, signed by online keys alone, skip the pull
         // request.
         github.update_pr(&branch, &body, !merge).await?;
@@ -215,8 +249,8 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     let config = Config::load(dir)?;
     // The config before the latest change to main, which the current metadata was built from.
     let previous = Config::load_rev(&git, "HEAD^").ok();
-    let changed = tufops_cloud::update_online(&config, previous.as_ref(), dir).await?;
-    if git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])?
+    let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
+    if !changed.is_empty()
         && let Err(err) = git.push(MAIN, false)
     {
         // If main moved on, the run for the newer commit does this work instead.
@@ -242,58 +276,10 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     if !offline.is_empty() && !git.remote_events()?.iter().any(|e| e == REFRESH_EVENT) {
         let branch = git.checkout_event(REFRESH_EVENT, false)?;
         repo.with_roles_from(&head, &offline).save(dir)?;
-        git.commit(
-            &format!("Start new versions of {}", offline.join(", ")),
-            &[METADATA],
-        )?;
+        let message = format!("Start new versions of {}", offline.join(", "));
+        git.commit(&message, &[METADATA])?;
         git.push(&branch, false)?;
         println!("Started {branch} for {offline:?}; its workflow run opens the pull request");
     }
-    report_renewals(github, &repo, &online).await
-}
-
-/// Keeps an issue open listing `roles`, the online roles in their signing period that CI can't
-/// sign, and closes it once there are none.
-async fn report_renewals(github: &GitHub, repo: &Repo, roles: &[String]) -> Result<()> {
-    let issues = github.client.issues(&github.owner, &github.repo);
-    let issue = github.open_issue(RENEW_TITLE).await?;
-    if roles.is_empty() {
-        if let Some(issue) = issue {
-            let close = issues.update(issue.number).state(IssueState::Closed);
-            close.send().await?;
-        }
-        return Ok(());
-    }
-    let mut body = String::from(
-        "CI can't sign these roles. Someone with their keys must renew them before they expire, \
-         with `tufops apply --event renew`.\n\n",
-    );
-    for role in roles {
-        let (_, expires) = repo.require_header(role)?;
-        let _ = writeln!(body, "- `{role}` expires {}", expires.format("%Y-%m-%d"));
-    }
-    match issue {
-        Some(issue) if issue.body.as_deref() == Some(&body) => {}
-        Some(issue) => drop(issues.update(issue.number).body(&body).send().await?),
-        None => drop(issues.create(RENEW_TITLE).body(body).send().await?),
-    }
-    Ok(())
-}
-
-/// Link to this workflow run.
-fn run_url() -> String {
-    let var = |name| std::env::var(name).unwrap_or_default();
-    let repo = format!("{}/{}", var("GITHUB_SERVER_URL"), var("GITHUB_REPOSITORY"));
-    format!("{repo}/actions/runs/{}", var("GITHUB_RUN_ID"))
-}
-
-async fn report_failure(github: &GitHub) -> Result<()> {
-    let branch = std::env::var("TUFOPS_BRANCH").unwrap_or_default();
-    let body = format!("tufops failed on `{branch}`: {}", run_url());
-    let issues = github.client.issues(&github.owner, &github.repo);
-    match github.open_issue(FAILURE_TITLE).await? {
-        Some(issue) => drop(issues.create_comment(issue.number, body).await?),
-        None => drop(issues.create(FAILURE_TITLE).body(body).send().await?),
-    }
-    Ok(())
+    github.report_renewals(&repo, &online).await
 }

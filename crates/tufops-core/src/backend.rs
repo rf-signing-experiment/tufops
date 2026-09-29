@@ -6,7 +6,12 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tuf::crypto::PublicKey;
+use tuf::crypto::{KeyType, PublicKey, SignatureScheme};
+
+/// Parses a PEM encoded public key. tufops supports only ECDSA P-256 keys.
+pub fn public_key_from_pem(pem: &str) -> tuf::Result<PublicKey> {
+    PublicKey::from_pem(pem, KeyType::Ecdsa, SignatureScheme::EcdsaSha2NistP256)
+}
 
 /// A private key that signs TUF metadata.
 #[async_trait]

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use dialoguer::Select;
+use dialoguer::{Password, Select};
 use sha2::{Digest, Sha256};
 use tuf::crypto::{PublicKey, SignatureScheme};
 use tufops_core::backend::Signer;
@@ -54,9 +54,12 @@ impl YubiKeySigner {
         })
     }
 
-    /// Sets the PIN used for each signature; slot 9c requires it before every signing operation.
-    pub fn set_pin(&self, pin: String) {
+    /// Asks for the PIN used for each signature; slot 9c requires it before every signing
+    /// operation.
+    pub fn ask_pin(&self) -> Result<()> {
+        let pin = Password::new().with_prompt("YubiKey PIN").interact()?;
         *self.pin.lock().unwrap() = Some(Zeroizing::new(pin));
+        Ok(())
     }
 
     pub fn has_pin(&self) -> bool {

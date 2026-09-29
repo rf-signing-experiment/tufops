@@ -1,14 +1,15 @@
 //! `tufops.toml`: the declarative description of keys and roles.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use tuf::crypto::{KeyId, KeyType, PublicKey, SignatureScheme};
+use tuf::crypto::{KeyId, PublicKey};
 use tuf::metadata::{MetadataPath, TargetPath};
 
+use crate::backend::public_key_from_pem;
 use crate::git::Git;
 use crate::repo::covers;
 
@@ -166,41 +167,19 @@ impl Config {
             .keys
             .get(name)
             .with_context(|| format!("unknown key {name}"))?;
-        PublicKey::from_pem(
-            &key.public_key,
-            KeyType::Ecdsa,
-            SignatureScheme::EcdsaSha2NistP256,
-        )
-        .with_context(|| format!("key {name}: public_key"))
+        public_key_from_pem(&key.public_key).with_context(|| format!("key {name}: public_key"))
     }
 
-    /// Configured keys by key id.
-    pub fn keys_by_id(&self) -> Result<HashMap<KeyId, (&str, &KeyConfig)>> {
-        self.keys
-            .iter()
-            .map(|(name, key)| {
-                Ok((
-                    self.public_key(name)?.key_id().clone(),
-                    (name.as_str(), key),
-                ))
-            })
-            .collect()
+    /// The configured key with id `id`, and its name.
+    pub fn key_by_id(&self, id: &KeyId) -> Option<(&String, &KeyConfig)> {
+        let has_id = |name: &String| self.public_key(name).is_ok_and(|k| k.key_id() == id);
+        self.keys.iter().find(|(name, _)| has_id(name))
     }
 
     /// A human readable name for a key id: its owner, or its name for online keys.
     pub fn describe_key(&self, id: &KeyId) -> String {
-        match self
-            .keys_by_id()
-            .ok()
-            .and_then(|keys| keys.get(id).copied())
-        {
-            Some((
-                _,
-                KeyConfig {
-                    owner: Some(owner), ..
-                },
-            )) => owner.clone(),
-            Some((name, _)) => format!("{name} (online)"),
+        match self.key_by_id(id) {
+            Some((name, key)) => (key.owner.clone()).unwrap_or_else(|| format!("{name} (online)")),
             None => "unknown key".to_owned(),
         }
     }

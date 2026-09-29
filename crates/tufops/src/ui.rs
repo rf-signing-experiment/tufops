@@ -6,7 +6,7 @@ use std::io::Write;
 use chrono::{DateTime, Utc};
 use console::style;
 use tufops_core::EventStatus;
-use tufops_core::status::{Key, Requirement, RoleStatus};
+use tufops_core::status::{Requirement, RoleStatus, names};
 
 /// Writes what a signing event changes and who has signed it: each role's changes, followed by
 /// its requirements.
@@ -77,9 +77,4 @@ fn version(role: &RoleStatus) -> String {
         ),
         Some(_) => format!("version {}, expires {}", role.version, date(&role.expires)),
     }
-}
-
-fn names(keys: &[Key]) -> String {
-    let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
-    names.join(", ")
 }

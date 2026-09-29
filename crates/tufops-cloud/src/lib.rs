@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use tufops_core::backend::{BlobStore, Signer};
+use tufops_core::git::Git;
+use tufops_core::repo::METADATA;
 use tufops_core::{Config, Repo};
 
 mod gcp;
@@ -33,14 +35,11 @@ pub async fn sign_online(
     repo: &mut Repo,
     roles: &[String],
 ) -> Result<()> {
-    let keys = config.keys_by_id()?;
     let mut signers: HashMap<&str, Box<dyn Signer>> = HashMap::new();
     for role in roles {
         for key in repo.missing_keys(base, role)? {
-            let Some(uri) = keys
-                .get(key.key_id())
-                .and_then(|(_, k)| k.online.as_deref())
-            else {
+            let key = config.key_by_id(key.key_id());
+            let Some(uri) = key.and_then(|(_, k)| k.online.as_deref()) else {
                 continue;
             };
             if !signers.contains_key(uri) {
@@ -52,17 +51,19 @@ pub async fn sign_online(
     Ok(())
 }
 
-/// Starts and signs new versions of the online roles in the working tree at `dir` that are due.
-/// `previous` is the config the current metadata was built from. Returns the roles changed.
+/// Starts and signs new versions of the online roles that are due, on the main branch checked out
+/// in `git`, and commits them. `previous` is the config the current metadata was built from.
+/// Returns the roles changed.
 pub async fn update_online(
+    git: &Git,
     config: &Config,
     previous: Option<&Config>,
-    dir: &std::path::Path,
 ) -> Result<Vec<String>> {
-    let mut repo = Repo::load(dir)?;
+    let mut repo = Repo::load(git.dir())?;
     let base = repo.clone();
     let changed = repo.update_online(config, previous, chrono::Utc::now())?;
     sign_online(config, &base, &mut repo, &changed).await?;
-    repo.save(dir)?;
+    repo.save(git.dir())?;
+    git.commit(&format!("Update {}", changed.join(", ")), &[METADATA])?;
     Ok(changed)
 }

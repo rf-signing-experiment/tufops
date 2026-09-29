@@ -6,7 +6,7 @@ use std::fmt;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tuf::crypto::{KeyId, PublicKey};
-use tuf::metadata::{RootMetadata, TargetDescription, TargetPath, TargetsMetadata};
+use tuf::metadata::{Delegation, RootMetadata, TargetDescription, TargetPath, TargetsMetadata};
 
 use crate::config::{Config, TOP_LEVEL_ROLES};
 use crate::publish::{target_object, target_sha256};
@@ -67,20 +67,13 @@ pub struct TargetFile {
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Change::Target {
-                path,
-                kind,
-                file: Some(file),
-            } => write!(
-                f,
-                "target {path} {kind} ({} bytes, sha256 {})",
-                file.length, file.sha256
-            ),
-            Change::Target {
-                path,
-                kind,
-                file: None,
-            } => write!(f, "target {path} {kind}"),
+            Change::Target { path, kind, file } => {
+                write!(f, "target {path} {kind}")?;
+                match file {
+                    Some(file) => write!(f, " ({} bytes, sha256 {})", file.length, file.sha256),
+                    None => Ok(()),
+                }
+            }
             Change::Other(text) => f.write_str(text),
         }
     }
@@ -120,13 +113,10 @@ impl EventStatus {
     /// Compares `head` with `base` (the main branch) and checks the signatures in `head`.
     pub fn new(config: &Config, base: &Repo, head: &Repo) -> Result<Self> {
         let (base_index, head_index) = (index_targets(base)?, index_targets(head)?);
-        let keys = config.keys_by_id()?;
         let key = |k: &PublicKey| Key {
             id: k.key_id().clone(),
             name: config.describe_key(k.key_id()),
-            online: keys
-                .get(k.key_id())
-                .is_some_and(|(_, conf)| conf.online.is_some()),
+            online: (config.key_by_id(k.key_id())).is_some_and(|(_, k)| k.online.is_some()),
         };
         let mut roles = vec![];
         for role in &head.event_roles() {
@@ -198,6 +188,20 @@ impl EventStatus {
         let names: BTreeSet<_> = awaited.map(|k| k.name.as_str()).collect();
         names.into_iter().collect()
     }
+
+    /// What happens next to the event, in words. `changed_files` are as for
+    /// `merges_automatically`.
+    pub fn next_step(&self, changed_files: &[String]) -> String {
+        if !self.complete() {
+            let waiting = self.waiting_for().join(", ");
+            format!("Waiting for signatures from {waiting}, who can add them with `tufops sign`.")
+        } else if self.merges_automatically(changed_files) {
+            "All signatures are in: the event merges automatically.".to_owned()
+        } else {
+            "All signatures are in: a maintainer can now review and merge its pull request."
+                .to_owned()
+        }
+    }
 }
 
 /// The start of a key id, enough to tell keys apart.
@@ -205,7 +209,16 @@ pub fn short(id: &KeyId) -> &str {
     id.as_str().get(..8).unwrap_or(id.as_str())
 }
 
-/// Describes how `role` in `head` differs from `base`, from the metadata that gets signed.
+/// Key names, comma separated, or `-` if there are none.
+pub fn names(keys: &[Key]) -> String {
+    let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
+    if names.is_empty() {
+        "-".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Every role listing each target path, with the description it gives.
 type TargetIndex = HashMap<TargetPath, Vec<(String, TargetDescription)>>;
 
@@ -223,6 +236,7 @@ fn index_targets(repo: &Repo) -> Result<TargetIndex> {
     Ok(index)
 }
 
+/// Describes how `role` in `head` differs from `base`, from the metadata that gets signed.
 fn changes(
     config: &Config,
     (base, base_index): (&Repo, &TargetIndex),
@@ -237,103 +251,81 @@ fn changes(
             let old = old.as_ref().map(|o| root_role_keys(o, top));
             key_changes(&mut out, config, &what, old, root_role_keys(&new, top));
         }
-    } else {
-        let new = head.require::<TargetsMetadata>(role)?;
-        let old = base.metadata::<TargetsMetadata>(role)?;
-        let by_name = |t: &TargetsMetadata| -> BTreeMap<String, _> {
-            let roles = t.delegations().roles().iter();
-            roles.map(|d| (d.name().to_string(), d.clone())).collect()
-        };
-        let (old_d, new_d) = (old.as_ref().map(by_name).unwrap_or_default(), by_name(&new));
-        for name in old_d.keys().chain(new_d.keys()).collect::<BTreeSet<_>>() {
-            let what = format!("delegation {name}");
-            let Some(d) = new_d.get(name) else {
-                out.push(Change::Other(format!("{what} removed")));
-                continue;
-            };
-            let old = old_d.get(name);
-            let old_paths: BTreeSet<_> = old
-                .iter()
-                .flat_map(|o| o.paths())
-                .map(|p| p.to_string())
-                .collect();
-            let new_paths: BTreeSet<_> = d.paths().iter().map(|p| p.to_string()).collect();
-            if old.is_none() {
-                out.push(Change::Other(format!("{what} added")));
-            }
-            new_paths
-                .difference(&old_paths)
-                .for_each(|p| out.push(Change::Other(format!("{what}: path {p} added"))));
-            old_paths
-                .difference(&new_paths)
-                .for_each(|p| out.push(Change::Other(format!("{what}: path {p} removed"))));
-            let old = old.map(|o| (o.threshold(), o.key_ids()));
-            key_changes(&mut out, config, &what, old, (d.threshold(), d.key_ids()));
-        }
-
-        let empty = HashMap::new();
-        let old_targets = old.as_ref().map_or(&empty, |o| o.targets());
-        let file = |path: &TargetPath, d: &TargetDescription| -> Result<_> {
-            Ok(Some(TargetFile {
-                length: d.length(),
-                sha256: target_sha256(d)?.to_string(),
-                object: target_object(path, d)?,
-            }))
-        };
-        // Another role listing the same file: where it moved from, or to, unchanged.
-        let other = |index: &TargetIndex, path: &TargetPath, d: &TargetDescription| {
-            let holders = index.get(path)?;
-            let found = holders.iter().find(|(r, desc)| r != role && desc == d);
-            found.map(|(r, _)| r.clone())
-        };
-        let (mut moved_in, mut moved_out) = (BTreeMap::new(), BTreeMap::new());
-        let paths: BTreeSet<_> = old_targets.keys().chain(new.targets().keys()).collect();
-        for path in paths {
-            let (kind, file) = match (old_targets.get(path), new.targets().get(path)) {
-                (None, Some(d)) => match other(base_index, path, d) {
-                    Some(from) => {
-                        *moved_in.entry(from).or_insert(0) += 1;
-                        continue;
-                    }
-                    None => ("added", file(path, d)?),
-                },
-                (Some(d), None) => match other(head_index, path, d) {
-                    Some(to) => {
-                        *moved_out.entry(to).or_insert(0) += 1;
-                        continue;
-                    }
-                    None => ("removed", None),
-                },
-                (Some(a), Some(b)) if a != b => ("changed", file(path, b)?),
-                _ => continue,
-            };
-            out.push(Change::Target {
-                path: path.to_string(),
-                kind,
-                file,
-            });
-        }
-        let targets = |n: usize| {
-            if n == 1 {
-                "1 target".to_owned()
-            } else {
-                format!("{n} targets")
-            }
-        };
-        for (from, n) in moved_in {
-            out.push(Change::Other(format!(
-                "{} moved here unchanged from {from}",
-                targets(n)
-            )));
-        }
-        for (to, n) in moved_out {
-            out.push(Change::Other(format!(
-                "{} moved unchanged to {to}",
-                targets(n)
-            )));
-        }
+        return Ok(out);
     }
 
+    let new = head.require::<TargetsMetadata>(role)?;
+    let old = base.metadata::<TargetsMetadata>(role)?;
+    let by_name = |t: &TargetsMetadata| -> BTreeMap<String, _> {
+        let roles = t.delegations().roles().iter();
+        roles.map(|d| (d.name().to_string(), d.clone())).collect()
+    };
+    let paths_of =
+        |d: &Delegation| -> BTreeSet<_> { d.paths().iter().map(|p| p.to_string()).collect() };
+    let (old_d, new_d) = (old.as_ref().map(by_name).unwrap_or_default(), by_name(&new));
+    for name in old_d.keys().chain(new_d.keys()).collect::<BTreeSet<_>>() {
+        let what = format!("delegation {name}");
+        let (old, Some(d)) = (old_d.get(name), new_d.get(name)) else {
+            out.push(Change::Other(format!("{what} removed")));
+            continue;
+        };
+        if old.is_none() {
+            out.push(Change::Other(format!("{what} added")));
+        }
+        let old_paths = old.map(paths_of).unwrap_or_default();
+        set_changes(&mut out, &format!("{what}: path"), old_paths, paths_of(d));
+        let old = old.map(|o| (o.threshold(), o.key_ids()));
+        key_changes(&mut out, config, &what, old, (d.threshold(), d.key_ids()));
+    }
+
+    let empty = HashMap::new();
+    let old_targets = old.as_ref().map_or(&empty, |o| o.targets());
+    let file = |path: &TargetPath, d: &TargetDescription| -> Result<_> {
+        Ok(Some(TargetFile {
+            length: d.length(),
+            sha256: target_sha256(d)?.to_string(),
+            object: target_object(path, d)?,
+        }))
+    };
+    // Another role listing the same file: where it moved from, or to, unchanged.
+    let other = |index: &TargetIndex, path: &TargetPath, d: &TargetDescription| {
+        let holders = index.get(path)?;
+        let found = holders.iter().find(|(r, desc)| r != role && desc == d);
+        found.map(|(r, _)| r.clone())
+    };
+    // How many targets moved unchanged, by where from or to.
+    let mut moved = BTreeMap::<String, usize>::new();
+    let mut count = |how| *moved.entry(how).or_default() += 1;
+    let paths: BTreeSet<_> = old_targets.keys().chain(new.targets().keys()).collect();
+    for path in paths {
+        let (kind, file) = match (old_targets.get(path), new.targets().get(path)) {
+            (None, Some(d)) => match other(base_index, path, d) {
+                Some(from) => {
+                    count(format!("moved here unchanged from {from}"));
+                    continue;
+                }
+                None => ("added", file(path, d)?),
+            },
+            (Some(d), None) => match other(head_index, path, d) {
+                Some(to) => {
+                    count(format!("moved unchanged to {to}"));
+                    continue;
+                }
+                None => ("removed", None),
+            },
+            (Some(a), Some(b)) if a != b => ("changed", file(path, b)?),
+            _ => continue,
+        };
+        out.push(Change::Target {
+            path: path.to_string(),
+            kind,
+            file,
+        });
+    }
+    for (how, n) in moved {
+        let s = if n == 1 { "" } else { "s" };
+        out.push(Change::Other(format!("{n} target{s} {how}")));
+    }
     Ok(out)
 }
 
@@ -345,22 +337,24 @@ fn key_changes(
     old: Option<(u32, &HashSet<KeyId>)>,
     (threshold, ids): (u32, &HashSet<KeyId>),
 ) {
-    let empty = HashSet::new();
-    let (old_threshold, old_ids) = old.unwrap_or((0, &empty));
-    let name = |id: &KeyId| format!("{} [{}]", config.describe_key(id), short(id));
-    let added: BTreeSet<_> = ids.difference(old_ids).map(name).collect();
-    let removed: BTreeSet<_> = old_ids.difference(ids).map(name).collect();
-    added
-        .iter()
-        .for_each(|k| out.push(Change::Other(format!("{what}: key {k} added"))));
-    removed
-        .iter()
-        .for_each(|k| out.push(Change::Other(format!("{what}: key {k} removed"))));
-    match old {
-        None => out.push(Change::Other(format!("{what}: threshold {threshold}"))),
-        Some(_) if old_threshold != threshold => out.push(Change::Other(format!(
-            "{what}: threshold {old_threshold} → {threshold}"
-        ))),
-        Some(_) => {}
-    }
+    let describe = |ids: &HashSet<KeyId>| -> BTreeSet<_> {
+        let name = |id| format!("{} [{}]", config.describe_key(id), short(id));
+        ids.iter().map(name).collect()
+    };
+    let old_keys = old.map(|(_, ids)| describe(ids)).unwrap_or_default();
+    set_changes(out, &format!("{what}: key"), old_keys, describe(ids));
+    let threshold = match old {
+        None => threshold.to_string(),
+        Some((old, _)) if old != threshold => format!("{old} → {threshold}"),
+        Some(_) => return,
+    };
+    out.push(Change::Other(format!("{what}: threshold {threshold}")));
+}
+
+/// Describes the items in `new` but not `old` as added, then those in `old` but not `new` as
+/// removed.
+fn set_changes(out: &mut Vec<Change>, what: &str, old: BTreeSet<String>, new: BTreeSet<String>) {
+    let added = new.difference(&old).map(|i| format!("{what} {i} added"));
+    let removed = old.difference(&new).map(|i| format!("{what} {i} removed"));
+    out.extend(added.chain(removed).map(Change::Other));
 }
