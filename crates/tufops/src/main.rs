@@ -3,7 +3,7 @@
 mod ui;
 mod yubikey;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -241,7 +241,7 @@ impl Event {
             },
             style(&self.branch).bold()
         );
-        needed.iter().for_each(|role| ui::print_role(role));
+        needed.iter().for_each(|r| ui::write_role(&mut stdout(), r));
         if !Confirm::new().with_prompt("Sign?").interact()? {
             println!("Not signed.");
             return Ok(false);
@@ -298,7 +298,7 @@ impl Event {
         }
         let status = self.status()?;
         println!();
-        ui::print_event(&self.branch, &status);
+        ui::write_event(&mut stdout(), &self.branch, &status);
         println!();
         if self.restart {
             println!("Pushed {}, replacing the earlier event.", self.branch);
@@ -342,7 +342,7 @@ fn status(dir: &Path) -> Result<()> {
         println!("No open signing events.");
     }
     for (event, status) in statuses {
-        ui::print_event(&format!("{SIGN_PREFIX}{event}"), &status);
+        ui::write_event(&mut stdout(), &format!("{SIGN_PREFIX}{event}"), &status);
         println!();
     }
     Ok(())

@@ -5,22 +5,22 @@
 //! new snapshot and timestamp versions, publishes, starts signing events for offline roles
 //! about to expire, and opens an issue for online roles about to expire that it can't sign.
 
+mod markdown;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use octocrab::Octocrab;
 use octocrab::models::issues::Issue;
 use octocrab::models::{IssueState, StatusState};
 use octocrab::params::State;
 use tufops_cloud::open_store;
-use tufops_core::backend::BlobStore;
 use tufops_core::git::{Git, MAIN, REMOTE, SIGN_PREFIX};
 use tufops_core::publish::publish;
 use tufops_core::repo::METADATA;
-use tufops_core::status::{Change, RoleStatus};
 use tufops_core::{Config, EventStatus, Repo};
 
 /// Signing event CI starts when offline roles are about to expire.
@@ -175,10 +175,9 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
         let merge = status.merges_automatically(&changed_files);
 
-        let mut body = format!(
-            "## Signing event `{branch}`\n\n{}\n",
-            markdown(&status, store.as_ref())
-        );
+        let mut body = String::new();
+        markdown::write_event(&mut body, &branch, &status, store.as_ref());
+        body.push('\n');
         body.push_str(&if !status.complete() {
             format!(
                 "Waiting for signatures from {}. Signers: check out the repository and run \
@@ -297,97 +296,4 @@ async fn report_failure(github: &GitHub) -> Result<()> {
         None => drop(issues.create(FAILURE_TITLE).body(body).send().await?),
     }
     Ok(())
-}
-
-/// The signing status as markdown for the pull request, linking target files to their uploads
-/// in `store`.
-fn markdown(status: &EventStatus, store: &dyn BlobStore) -> String {
-    let mut out =
-        String::from("| Role | Version | Expires | Signatures | Signed by | Waiting for |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
-    let names = |keys: &[tufops_core::status::Key]| {
-        let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
-        if names.is_empty() {
-            "-".to_owned()
-        } else {
-            names.join(", ")
-        }
-    };
-    for role in &status.roles {
-        let (version, expires) = version(role);
-        for req in &role.requirements {
-            let _ = writeln!(
-                out,
-                "| {}{} | {} | {} | {} {} of {} | {} | {} |",
-                role.role,
-                if req.previous_root {
-                    " (previous keys)"
-                } else {
-                    ""
-                },
-                version,
-                expires,
-                if req.met() { "✅" } else { "⏳" },
-                req.signed.len(),
-                req.threshold,
-                names(&req.signed),
-                names(req.awaited()),
-            );
-        }
-    }
-    // GitHub rejects descriptions over 65536 characters; leave room for the text around this.
-    const LIMIT: usize = 30_000;
-    let total: usize = status.roles.iter().map(|r| r.changes.len()).sum();
-    let mut shown = 0;
-    for role in status.roles.iter().filter(|r| !r.changes.is_empty()) {
-        if out.len() > LIMIT {
-            break;
-        }
-        let _ = writeln!(out, "\n**Changes to {}**\n", role.role);
-        for change in &role.changes {
-            if out.len() > LIMIT {
-                break;
-            }
-            shown += 1;
-            let _ = match change {
-                Change::Target {
-                    path,
-                    kind,
-                    file: Some(file),
-                } => writeln!(
-                    out,
-                    "- target [`{path}`](<{}>) {kind} ({} bytes, sha256 `{}`)",
-                    store.public_url(&file.object),
-                    file.length,
-                    file.sha256
-                ),
-                Change::Target {
-                    path,
-                    kind,
-                    file: None,
-                } => writeln!(out, "- target `{path}` {kind}"),
-                Change::Other(text) => writeln!(out, "- {text}"),
-            };
-        }
-    }
-    if shown < total {
-        let _ = writeln!(
-            out,
-            "\n…and {} more changes: run `tufops status` for the full list.",
-            total - shown
-        );
-    }
-    out
-}
-
-/// The version and expiry columns: what main has, and what the event changes them to.
-fn version(role: &RoleStatus) -> (String, String) {
-    let date = |d: &DateTime<Utc>| d.format("%Y-%m-%d").to_string();
-    match role.base {
-        Some((version, expires)) if version != role.version => (
-            format!("{version} → {}", role.version),
-            format!("{} → {}", date(&expires), date(&role.expires)),
-        ),
-        _ => (role.version.to_string(), date(&role.expires)),
-    }
 }

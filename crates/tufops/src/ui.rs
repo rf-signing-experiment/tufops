@@ -1,55 +1,41 @@
-//! Plain text output for the terminal.
+//! The signing status as plain text for the terminal. `tufops-ci` renders the same status as
+//! markdown for pull requests in `markdown.rs`, with matching functions: change the two together.
+
+use std::io::Write;
 
 use chrono::{DateTime, Utc};
 use console::style;
 use tufops_core::EventStatus;
 use tufops_core::status::{Key, Requirement, RoleStatus};
 
-/// Prints what a signing event changes and who has signed it.
-pub fn print_event(branch: &str, status: &EventStatus) {
-    println!("{}", style(branch).bold());
+/// Writes what a signing event changes and who has signed it: each role's changes, followed by
+/// its requirements.
+pub fn write_event(out: &mut impl Write, branch: &str, status: &EventStatus) {
+    let _ = writeln!(out, "{}", style(branch).bold());
     if status.roles.is_empty() {
-        println!("  nothing to sign");
+        let _ = writeln!(out, "  nothing to sign");
     }
     for role in &status.roles {
-        print_role(role);
-        role.requirements.iter().for_each(print_requirement);
+        write_role(out, role);
+        role.requirements
+            .iter()
+            .for_each(|req| write_requirement(out, req));
     }
 }
 
-/// Prints a role's new version and every change to its metadata.
-pub fn print_role(role: &RoleStatus) {
-    let date = |d: &DateTime<Utc>| d.format("%Y-%m-%d %H:%M UTC").to_string();
-    let header = match role.base {
-        None => format!(
-            "new, version {}, expires {}",
-            role.version,
-            date(&role.expires)
-        ),
-        Some((version, expires)) if version != role.version => format!(
-            "version {version} → {}, expires {} (was {})",
-            role.version,
-            date(&role.expires),
-            date(&expires)
-        ),
-        Some(_) => format!("version {}, expires {}", role.version, date(&role.expires)),
-    };
-    println!("  {}  {header}", style(&role.role).bold());
+/// Writes a role's version and expiry, and every change to its metadata.
+pub fn write_role(out: &mut impl Write, role: &RoleStatus) {
+    let _ = writeln!(out, "  {}  {}", style(&role.role).bold(), version(role));
     if role.changes.is_empty() && role.base.is_some_and(|(v, _)| v != role.version) {
-        println!("    no changes besides version and expiry");
+        let _ = writeln!(out, "    no changes besides version and expiry");
     }
     for change in &role.changes {
-        println!("    {change}");
+        let _ = writeln!(out, "    {change}");
     }
 }
 
-fn print_requirement(req: &Requirement) {
-    let names = |keys: &[Key]| {
-        keys.iter()
-            .map(|k| k.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+/// Writes whether a requirement is met, who signed it, and who it still waits for.
+fn write_requirement(out: &mut impl Write, req: &Requirement) {
     let mark = if req.met() {
         style("✓").green()
     } else {
@@ -69,7 +55,31 @@ fn print_requirement(req: &Requirement) {
         line += &format!(", signed by {}", names(&req.signed));
     }
     if !req.met() {
-        line += &format!(", waiting for {}", names(&req.unsigned));
+        line += &format!(", waiting for {}", names(req.awaited()));
     }
-    println!("{line}");
+    let _ = writeln!(out, "{line}");
+}
+
+/// The version and expiry: what main has, and what the event changes them to.
+fn version(role: &RoleStatus) -> String {
+    let date = |d: &DateTime<Utc>| d.format("%Y-%m-%d %H:%M UTC").to_string();
+    match role.base {
+        None => format!(
+            "new, version {}, expires {}",
+            role.version,
+            date(&role.expires)
+        ),
+        Some((version, expires)) if version != role.version => format!(
+            "version {version} → {}, expires {} (was {})",
+            role.version,
+            date(&role.expires),
+            date(&expires)
+        ),
+        Some(_) => format!("version {}, expires {}", role.version, date(&role.expires)),
+    }
+}
+
+fn names(keys: &[Key]) -> String {
+    let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
+    names.join(", ")
 }
