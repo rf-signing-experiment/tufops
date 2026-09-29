@@ -585,6 +585,14 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 All commands take `--repo <path>` (default `.`) and `--device <serial number>`, the YubiKey to
 use when several are plugged in.
 
+To see what tufops does, for example when a command fails in a way you don't understand, set
+`TUFOPS_LOG`: `TUFOPS_LOG=tufops=debug tufops sign` logs every git command, storage upload and
+signature to stderr. It takes
+[`EnvFilter` directives](https://docs.rs/tracing-subscriber/0.3/tracing_subscriber/filter/struct.EnvFilter.html):
+`tufops=debug` shows tufops's own logs, and plain `debug` adds those of the libraries it uses,
+such as the Google Cloud and GitHub clients. `tufops-ci` reads it too: to debug the automation,
+add `TUFOPS_LOG: tufops=debug` to the `env` of the `tufops` job in `tufops.yml`.
+
 ### Crates
 
 | Crate | Purpose |

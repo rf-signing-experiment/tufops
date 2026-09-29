@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, SubsecRound, Utc};
+use tracing::{debug, warn};
 use tuf::crypto::{KeyId, PublicKey, Signature, SignatureValue};
 use tuf::metadata::{
     Delegation, Delegations, Metadata, MetadataDescription, MetadataPath, RawSignedMetadata,
@@ -239,9 +240,14 @@ impl Repo {
         let (sigs, raw) = Pouf1::deserialize_signed(self.require_raw(role)?)?;
         let input = Pouf1::signing_input(&raw)?;
         let path = MetadataPath::new(role.to_owned())?;
+        let verifies = |k: &PublicKey, s: &Signature| {
+            k.verify(&path, &input, s)
+                .inspect_err(|err| warn!(role, key = %k.key_id(), "bad signature: {err}"))
+                .is_ok()
+        };
         let valid = |k: &PublicKey| {
             sigs.iter()
-                .any(|s| s.key_id() == k.key_id() && k.verify(&path, &input, s).is_ok())
+                .any(|s| s.key_id() == k.key_id() && verifies(k, s))
         };
         Ok(keys.iter().filter(|k| valid(k)).cloned().collect())
     }
@@ -263,6 +269,7 @@ impl Repo {
         let (mut sigs, raw) = Pouf1::deserialize_signed(self.require_raw(role)?)?;
         let input = Pouf1::signing_input(&raw)?;
         let key = signer.public_key();
+        debug!(role, key = %key.key_id(), "signing");
         let sig = Signature::new(
             key.key_id().clone(),
             SignatureValue::new(signer.sign(&input).await?),
@@ -300,16 +307,25 @@ impl Repo {
             let expiry_changed = previous.is_some_and(|p| p.expires_days != config.expires_days);
             let keys_changed = base.header(role)?.is_some_and(|(v, _)| v == cur.version())
                 && !self.missing_keys(base, role)?.is_empty();
-            if unchanged
-                && !expiry_changed
-                && !keys_changed
-                && !config.in_signing_period(cur.expires(), now)
-            {
+            let in_signing_period = config.in_signing_period(cur.expires(), now);
+            debug!(
+                role,
+                version = cur.version(),
+                expires = %cur.expires(),
+                unchanged,
+                expiry_changed,
+                keys_changed,
+                in_signing_period,
+                "checking whether {role} needs a new version"
+            );
+            if unchanged && !expiry_changed && !keys_changed && !in_signing_period {
                 return Ok(None);
             }
         }
         let version = base.header(role)?.map_or(1, |(v, _)| v + 1);
-        let metadata = build(version, now + Duration::days(config.expires_days))?;
+        let expires = now + Duration::days(config.expires_days);
+        debug!(role, version, %expires, "starting a new version of {role}");
+        let metadata = build(version, expires)?;
         let signed = SignedMetadataBuilder::<Pouf1, M>::from_metadata(&metadata)?.build();
         self.put(role, signed.to_raw()?.as_bytes())?;
         Ok(Some(role.to_owned()))

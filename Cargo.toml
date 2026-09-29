@@ -30,6 +30,8 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "fs"] }
 toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tuf = { git = "https://github.com/rf-signing-experiment/rust-tuf.git", branch = "tbdsigning" }
 url = "2.5.8"
 walkdir = "2.5.0"

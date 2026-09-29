@@ -13,6 +13,7 @@ google-cloud-storage.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+tracing.workspace = true
 tuf.workspace = true
 tufops-core.workspace = true
 url.workspace = true

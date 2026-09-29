@@ -9,6 +9,7 @@
 mod markdown;
 
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,8 @@ use octocrab::issues::IssueHandler;
 use octocrab::models::issues::Issue;
 use octocrab::models::{IssueState, StatusState};
 use octocrab::params::State;
+use tracing::debug;
+use tracing_subscriber::EnvFilter;
 use tufops_cloud::open_store;
 use tufops_core::git::{Git, MAIN, REMOTE, SIGN_PREFIX};
 use tufops_core::publish::publish;
@@ -34,7 +37,7 @@ const RENEW_TITLE: &str = "tufops roles need renewing";
 /// signatures can't be merged.
 const STATUS_CONTEXT: &str = "tufops/signatures";
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
     /// The repository's git checkout.
@@ -44,7 +47,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Handle the branch in `TUFOPS_BRANCH`: a signing event or main.
     Run,
@@ -91,6 +94,7 @@ impl GitHub {
         } else {
             StatusState::Pending
         };
+        debug!(sha, ?state, description, "setting {STATUS_CONTEXT}");
         (self.client.repos(&self.owner, &self.repo))
             .create_status(sha.to_owned(), state)
             .context(STATUS_CONTEXT.to_owned())
@@ -110,10 +114,10 @@ impl GitHub {
             .per_page(100u8)
             .send()
             .await?;
-        Ok(open
-            .items
-            .into_iter()
-            .find(|i| i.title == title && i.pull_request.is_none()))
+        let count = open.items.len();
+        let issue = (open.items.into_iter()).find(|i| i.title == title && i.pull_request.is_none());
+        debug!(title, open = count, found = ?issue.as_ref().map(|i| i.number), "looked for issue");
+        Ok(issue)
     }
 
     /// Updates the description of the open pull request for `branch`, or creates one if `create`.
@@ -122,6 +126,8 @@ impl GitHub {
         let head = format!("{}:{branch}", self.owner);
         let open = pulls.list().state(State::Open).head(head).send().await?;
         let title = format!("Signing event {branch}");
+        let pr = open.items.first().map(|pr| pr.number);
+        debug!(?pr, create, "updating the pull request for {branch}");
         match open.items.first() {
             Some(pr) => drop(pulls.update(pr.number).body(body).send().await?),
             None if create => drop(pulls.create(title, branch, MAIN).body(body).send().await?),
@@ -173,6 +179,8 @@ impl GitHub {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing()?;
+    debug!(?cli, "tufops-ci {}", env!("CARGO_PKG_VERSION"));
     let github = GitHub::from_env()?;
     let branch = std::env::var("TUFOPS_BRANCH").context("TUFOPS_BRANCH");
     match cli.command {
@@ -188,6 +196,21 @@ async fn main() -> Result<()> {
         }
         Command::ReportFailure => github.report_failure(&branch.unwrap_or_default()).await,
     }
+}
+
+/// Logs to stderr when `TUFOPS_LOG` is set, filtered by its directives (such as `tufops=debug`).
+fn init_tracing() -> Result<()> {
+    let directives = std::env::var("TUFOPS_LOG").unwrap_or_default();
+    if directives.is_empty() {
+        return Ok(());
+    }
+    let filter = EnvFilter::try_new(&directives).context("invalid TUFOPS_LOG")?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+    Ok(())
 }
 
 /// Merges main into the checked out signing event (without pushing that merge back), so the
@@ -219,6 +242,14 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         let store = open_store(&config.storage).await?;
         let status = EventStatus::new(&config, &Repo::load_rev(&git, &main)?, &Repo::load(dir)?)?;
         let merge = status.merges_automatically(&changed_files);
+        debug!(
+            attempt,
+            ?changed_files,
+            complete = status.complete(),
+            offline = status.offline(),
+            merge,
+            "checked whether {branch} merges automatically"
+        );
 
         let next_step = status.next_step(&changed_files);
         let mut body = String::new();
@@ -248,8 +279,11 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     let git = Git::new(dir);
     let config = Config::load(dir)?;
     // The config before the latest change to main, which the current metadata was built from.
-    let previous = Config::load_rev(&git, "HEAD^").ok();
+    let previous = Config::load_rev(&git, "HEAD^")
+        .inspect_err(|err| debug!("no previous config: {err:#}"))
+        .ok();
     let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
+    debug!(?changed, "updated the online roles");
     if !changed.is_empty()
         && let Err(err) = git.push(MAIN, false)
     {
@@ -273,6 +307,7 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     // CI renewed the online roles it signs above, so these are ones it can't sign.
     let (online, offline): (Vec<_>, Vec<_>) =
         expiring.into_iter().partition(|r| config.online_only(r));
+    debug!(?online, ?offline, "roles in their signing period");
     if !offline.is_empty() && !git.remote_events()?.iter().any(|e| e == REFRESH_EVENT) {
         let branch = git.checkout_event(REFRESH_EVENT, false)?;
         repo.with_roles_from(&head, &offline).save(dir)?;

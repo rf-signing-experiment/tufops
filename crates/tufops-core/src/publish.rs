@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use md5::{Digest, Md5};
+use tracing::debug;
 use tuf::Database;
 use tuf::crypto::{HashAlgorithm, HashValue};
 use tuf::metadata::{
@@ -97,11 +98,16 @@ fn metadata_objects(repo: &Repo) -> Result<BTreeMap<String, Vec<u8>>> {
 /// of the same version, which means the metadata was published from a history that diverged.
 async fn check_timestamp(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
     let Some(published) = store.get(TIMESTAMP).await? else {
+        debug!("storage has no timestamp yet");
         return Ok(());
     };
     let parsed = parse_unverified::<TimestampMetadata>(&published);
     let published_version = parsed.context("parsing the published timestamp")?.version();
     let (version, _) = repo.require_header("timestamp")?;
+    debug!(
+        published_version,
+        version, "checking the published timestamp"
+    );
     ensure!(
         published_version <= version,
         "storage has timestamp version {published_version}, newer than this repository's \
@@ -146,6 +152,12 @@ pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> 
                 .is_none_or(|md5| md5[..] != Md5::digest(data)[..])
         })
         .collect();
+    debug!(
+        uploaded_targets = uploaded.len(),
+        published_metadata = published.len(),
+        changed = changed.len(),
+        "compared the repository with storage"
+    );
     // Clients start from timestamp.json, so it must only refer to files already uploaded.
     changed.sort_by_key(|(name, _)| name == TIMESTAMP);
     let mut names = vec![];

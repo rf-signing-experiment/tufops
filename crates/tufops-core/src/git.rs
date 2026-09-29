@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
+use tracing::debug;
 
 use crate::repo::METADATA;
 
@@ -26,11 +27,19 @@ impl Git {
     }
 
     fn output(&self, args: &[&str]) -> Result<std::process::Output> {
-        Command::new("git")
+        let command = args.join(" ");
+        debug!("git {command}");
+        let out = Command::new("git")
             .current_dir(&self.dir)
             .args(args)
             .output()
-            .with_context(|| format!("running git {}", args.join(" ")))
+            .with_context(|| format!("running git {command}"))?;
+        // Some callers expect failures and check the status themselves, dropping stderr.
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            debug!(stderr = stderr.trim(), "git {command}: {}", out.status);
+        }
+        Ok(out)
     }
 
     /// Runs git, returning its trimmed standard output.

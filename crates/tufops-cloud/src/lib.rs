@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
+use tracing::debug;
 use tufops_core::backend::{BlobStore, Signer};
 use tufops_core::git::Git;
 use tufops_core::repo::METADATA;
@@ -38,8 +39,9 @@ pub async fn sign_online(
     let mut signers: HashMap<&str, Box<dyn Signer>> = HashMap::new();
     for role in roles {
         for key in repo.missing_keys(base, role)? {
-            let key = config.key_by_id(key.key_id());
-            let Some(uri) = key.and_then(|(_, k)| k.online.as_deref()) else {
+            let id = key.key_id();
+            let Some(uri) = config.key_by_id(id).and_then(|(_, k)| k.online.as_deref()) else {
+                debug!(role, key = %id, "not an online key, leaving the signature to its holder");
                 continue;
             };
             if !signers.contains_key(uri) {

@@ -10,6 +10,7 @@ use google_cloud_kms_v1::client::KeyManagementService;
 use google_cloud_kms_v1::model::Digest;
 use google_cloud_storage::client::{Storage, StorageControl};
 use sha2::{Digest as _, Sha256};
+use tracing::debug;
 use tuf::crypto::PublicKey;
 use tufops_core::backend::{BlobStore, Signer, public_key_from_pem};
 use url::Url;
@@ -23,6 +24,7 @@ pub struct KmsSigner {
 
 impl KmsSigner {
     pub async fn new(name: &str) -> Result<Self> {
+        debug!("fetching the public key of Cloud KMS key {name}");
         let client = KeyManagementService::builder().build().await?;
         let key = client.get_public_key().set_name(name).send().await?;
         let public = public_key_from_pem(&key.pem)
@@ -72,6 +74,7 @@ impl Gcs {
     pub async fn new(path: &str) -> Result<Self> {
         let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
         let prefix = prefix.trim_matches('/');
+        debug!(bucket, prefix, "opening Cloud Storage");
         let storage_url = Url::parse("https://storage.googleapis.com/")?;
         Ok(Self {
             public: with_path(storage_url, &format!("{bucket}/{prefix}")),
@@ -126,6 +129,7 @@ impl BlobStore for Gcs {
                 );
             }
             if page.next_page_token.is_empty() {
+                debug!(prefix, count = objects.len(), "listed objects");
                 return Ok(objects);
             }
             token = page.next_page_token;
@@ -146,6 +150,7 @@ impl BlobStore for Gcs {
     }
 
     async fn put(&self, name: &str, data: Vec<u8>) -> Result<()> {
+        debug!(name, bytes = data.len(), "uploading");
         (self.storage)
             .write_object(&self.bucket, self.object(name), Bytes::from(data))
             .set_cache_control("no-cache")

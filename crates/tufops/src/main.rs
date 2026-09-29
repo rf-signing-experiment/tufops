@@ -12,6 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use console::style;
 use dialoguer::{Confirm, MultiSelect, Select};
 use futures_util::{StreamExt, TryStreamExt, stream};
+use tracing::debug;
+use tracing_subscriber::EnvFilter;
 use tuf::crypto::HashAlgorithm;
 use tuf::metadata::{TargetDescription, TargetPath};
 use tufops_cloud::{open_signer, open_store, sign_online};
@@ -26,7 +28,7 @@ use walkdir::WalkDir;
 
 use crate::yubikey::YubiKeySigner;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
     /// The repository's git checkout.
@@ -39,7 +41,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Show open signing events and who still has to sign them.
     Status,
@@ -89,7 +91,7 @@ enum Command {
 }
 
 /// The signing event a command makes its change in.
-#[derive(Args)]
+#[derive(Args, Debug)]
 struct EventArgs {
     /// Signing event to make the change in (without `sign/`); defaults to one named after the
     /// change.
@@ -110,6 +112,8 @@ impl EventArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing()?;
+    debug!(?cli, "tufops {}", env!("CARGO_PKG_VERSION"));
     let dir = cli.repo.as_path();
     let device = cli.device;
     match cli.command {
@@ -121,7 +125,9 @@ async fn main() -> Result<()> {
             let mut ev = event.open(dir, "config")?;
             // Uncommitted edits to tufops.toml are what is being applied; the committed config is
             // what the metadata was built from.
-            let previous = Config::load_rev(&ev.git, "HEAD").ok();
+            let previous = Config::load_rev(&ev.git, "HEAD")
+                .inspect_err(|err| debug!("no previous config: {err:#}"))
+                .ok();
             ev.head
                 .apply_config(&ev.config, previous.as_ref(), &ev.base, Utc::now())?;
             ev.sign_and_finish("Apply tufops.toml", &[METADATA, CONFIG_FILE], device)
@@ -130,7 +136,9 @@ async fn main() -> Result<()> {
         Command::Online { push } => {
             let git = Git::new(dir);
             ensure!(git.current_branch()? == MAIN, "check out {MAIN} first");
-            let previous = Config::load_rev(&git, "HEAD^").ok();
+            let previous = Config::load_rev(&git, "HEAD^")
+                .inspect_err(|err| debug!("no previous config: {err:#}"))
+                .ok();
             let config = Config::load(dir)?;
             let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
             if changed.is_empty() {
@@ -164,6 +172,21 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Logs to stderr when `TUFOPS_LOG` is set, filtered by its directives (such as `tufops=debug`).
+fn init_tracing() -> Result<()> {
+    let directives = std::env::var("TUFOPS_LOG").unwrap_or_default();
+    if directives.is_empty() {
+        return Ok(());
+    }
+    let filter = EnvFilter::try_new(&directives).context("invalid TUFOPS_LOG")?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+    Ok(())
 }
 
 /// Shows `err` and asks whether to try again. Never retries when there is no one to ask.

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use dialoguer::{Password, Select};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 use tuf::crypto::{PublicKey, SignatureScheme};
 use tufops_core::backend::Signer;
 use x509_cert::der::Encode;
@@ -31,6 +32,7 @@ impl YubiKeySigner {
         };
         let mut yubikey = YubiKey::open_by_serial(Serial(serial))
             .with_context(|| format!("no YubiKey with serial number {serial} found"))?;
+        debug!(serial, firmware = %yubikey.version(), "opened YubiKey");
         let metadata = match piv::metadata(&mut yubikey, SlotId::Signature) {
             Err(yubikey::Error::NotSupported) => {
                 bail!("YubiKey {serial} is too old: tufops needs firmware 5.3 or later")
@@ -72,7 +74,12 @@ fn choose() -> Result<u32> {
     let mut readers = Readers::open().context("no YubiKey found")?;
     let found: Vec<_> = readers
         .iter()?
-        .filter_map(|reader| reader.open().ok())
+        .filter_map(|reader| {
+            let yubikey = reader.open();
+            yubikey
+                .inspect_err(|err| debug!("skipping reader {}: {err}", reader.name()))
+                .ok()
+        })
         .map(|yubikey| {
             (
                 yubikey.serial().0,
