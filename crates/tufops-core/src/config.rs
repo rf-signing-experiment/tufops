@@ -10,6 +10,7 @@ use tuf::crypto::{KeyId, KeyType, PublicKey, SignatureScheme};
 use tuf::metadata::{MetadataPath, TargetPath};
 
 use crate::git::Git;
+use crate::repo::covers;
 
 pub const FILE: &str = "tufops.toml";
 
@@ -81,6 +82,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        let mut paths = vec![];
         for (name, key) in &self.keys {
             ensure!(
                 key.owner.is_some() != key.online.is_some(),
@@ -115,20 +117,16 @@ impl Config {
                 "role {name}: `paths` must be set on delegated roles only"
             );
             for path in &role.paths {
-                TargetPath::new(path.clone()).with_context(|| format!("role {name}: path"))?;
+                let path = TargetPath::new(path).with_context(|| format!("role {name}: path"))?;
+                paths.push((name, path));
             }
         }
         // Clients stop at the first delegation covering a target, and delegations are always in
         // alphabetical order, so each path may belong to one role only.
-        let paths: Vec<_> = self
-            .delegations()
-            .flat_map(|(role, conf)| conf.paths.iter().map(move |path| (role, path)))
-            .collect();
-        let covers = |dir: &str, path: &str| dir.ends_with('/') && path.starts_with(dir);
         for (i, (a, p)) in paths.iter().enumerate() {
             for (b, q) in &paths[i + 1..] {
                 ensure!(
-                    a == b || !(p == q || covers(p, q) || covers(q, p)),
+                    a == b || !(covers(p, q) || covers(q, p)),
                     "roles {a} ({p}) and {b} ({q}) overlap: each path may belong to one role only"
                 );
             }

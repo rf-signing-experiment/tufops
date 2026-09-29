@@ -98,7 +98,7 @@ impl Repo {
         self.files.get(&file(role)).map(Vec::as_slice)
     }
 
-    fn require_raw(&self, role: &str) -> Result<&[u8]> {
+    pub fn require_raw(&self, role: &str) -> Result<&[u8]> {
         self.raw(role)
             .with_context(|| format!("{role} metadata is missing"))
     }
@@ -123,8 +123,7 @@ impl Repo {
         let mut pretty = serde_json::to_vec_pretty(&value)?;
         pretty.push(b'\n');
         if role == "root" {
-            let raw = RawSignedMetadata::<Pouf1, RootMetadata>::new(pretty.clone());
-            let version = raw.parse_untrusted()?.assume_valid()?.version();
+            let version = parse_unverified::<RootMetadata>(&pretty)?.version();
             self.files.insert(
                 format!("{ROOT_HISTORY}/{version}.root.json"),
                 pretty.clone(),
@@ -136,17 +135,11 @@ impl Repo {
 
     /// Parses `role` without checking its signatures.
     pub fn metadata<M: Metadata>(&self, role: &str) -> Result<Option<M>> {
-        let Some(bytes) = self.raw(role) else {
-            return Ok(None);
-        };
-        let raw = RawSignedMetadata::<Pouf1, M>::new(bytes.to_vec());
-        let parsed = raw.parse_untrusted().and_then(|s| s.assume_valid());
-        Ok(Some(
-            parsed.with_context(|| format!("parsing {role} metadata"))?,
-        ))
+        let parse = |b| parse_unverified(b).with_context(|| format!("parsing {role} metadata"));
+        self.raw(role).map(parse).transpose()
     }
 
-    fn require<M: Metadata>(&self, role: &str) -> Result<M> {
+    pub fn require<M: Metadata>(&self, role: &str) -> Result<M> {
         self.metadata(role)?
             .with_context(|| format!("{role} metadata is missing"))
     }
@@ -176,6 +169,17 @@ impl Repo {
             .collect()
     }
 
+    /// The roles signing events sign: all but snapshot and timestamp, which CI signs on main.
+    /// Root comes first, then targets, then the delegated roles.
+    pub fn event_roles(&self) -> Vec<String> {
+        let mut roles: Vec<_> = self
+            .roles()
+            .filter(|r| !matches!(*r, "snapshot" | "timestamp"))
+            .collect();
+        roles.sort_by_key(|r| (*r != "root", *r != "targets", *r));
+        roles.into_iter().map(str::to_owned).collect()
+    }
+
     /// Version and expiry of `role`.
     pub fn header(&self, role: &str) -> Result<Option<(u32, DateTime<Utc>)>> {
         fn get<M: Metadata>(repo: &Repo, role: &str) -> Result<Option<(u32, DateTime<Utc>)>> {
@@ -189,6 +193,11 @@ impl Repo {
             "timestamp" => get::<TimestampMetadata>(self, role),
             _ => get::<TargetsMetadata>(self, role),
         }
+    }
+
+    pub fn require_header(&self, role: &str) -> Result<(u32, DateTime<Utc>)> {
+        self.header(role)?
+            .with_context(|| format!("{role} metadata is missing"))
     }
 
     /// Threshold and keys `role` must be signed with, according to this repository's metadata.
@@ -212,12 +221,7 @@ impl Repo {
             ));
         }
         let root = self.root()?;
-        let (threshold, ids) = match role {
-            "root" => (root.root().threshold(), root.root().key_ids()),
-            "targets" => (root.targets().threshold(), root.targets().key_ids()),
-            "snapshot" => (root.snapshot().threshold(), root.snapshot().key_ids()),
-            _ => (root.timestamp().threshold(), root.timestamp().key_ids()),
-        };
+        let (threshold, ids) = root_role_keys(&root, role);
         Ok((threshold, pick(ids, root.keys())))
     }
 
@@ -288,10 +292,12 @@ impl Repo {
         &mut self,
         base: &Repo,
         role: &str,
-        (config, previous): (&RoleConfig, Option<&Config>),
+        config: &Config,
+        previous: Option<&Config>,
         now: DateTime<Utc>,
         build: Build<M>,
     ) -> Result<bool> {
+        let config = config.role(role)?;
         let now = now.trunc_subsecs(0);
         if let Some(cur) = self.metadata::<M>(role)? {
             let unchanged = build(cur.version(), *cur.expires())? == cur;
@@ -329,8 +335,7 @@ impl Repo {
         now: DateTime<Utc>,
     ) -> Result<Vec<String>> {
         let mut changed = vec![];
-        let root = (config.role("root")?, previous);
-        if self.update(base, "root", root, now, root_builder(config)?)? {
+        if self.update(base, "root", config, previous, now, root_builder(config)?)? {
             changed.push("root".to_owned());
         }
 
@@ -355,19 +360,13 @@ impl Repo {
 
         let map = targets.remove("targets").unwrap_or_default();
         let build = targets_builder(map, delegations);
-        if self.update(
-            base,
-            "targets",
-            (config.role("targets")?, previous),
-            now,
-            build,
-        )? {
+        if self.update(base, "targets", config, previous, now, build)? {
             changed.push("targets".to_owned());
         }
-        for (role, role_config) in config.delegations() {
+        for (role, _) in config.delegations() {
             let map = targets.remove(role).unwrap_or_default();
             let build = targets_builder(map, Delegations::default());
-            if self.update(base, role, (role_config, previous), now, build)? {
+            if self.update(base, role, config, previous, now, build)? {
                 changed.push(role.clone());
             }
         }
@@ -400,7 +399,7 @@ impl Repo {
             let mut map = cur.targets().clone();
             map.extend(new);
             let build = targets_builder(map, cur.delegations().clone());
-            if self.update(base, &role, (config.role(&role)?, None), now, build)? {
+            if self.update(base, &role, config, None, now, build)? {
                 changed.push(role);
             }
         }
@@ -417,7 +416,7 @@ impl Repo {
         patterns: &[TargetPath],
         now: DateTime<Utc>,
     ) -> Result<(Vec<String>, usize)> {
-        let matches = |path: &TargetPath| patterns.iter().any(|p| path == p || path.is_child(p));
+        let matches = |path: &TargetPath| patterns.iter().any(|p| covers(p, path));
         let (mut changed, mut removed) = (vec![], 0);
         for role in self.targets_roles() {
             let cur = self.require::<TargetsMetadata>(&role)?;
@@ -428,7 +427,7 @@ impl Repo {
             }
             removed += cur.targets().len() - map.len();
             let build = targets_builder(map, cur.delegations().clone());
-            if self.update(base, &role, (config.role(&role)?, None), now, build)? {
+            if self.update(base, &role, config, None, now, build)? {
                 changed.push(role);
             }
         }
@@ -449,11 +448,10 @@ impl Repo {
         let base = self.clone();
         let mut changed = vec![];
         for role in self.targets_roles() {
-            let role_config = config.role(&role)?;
             if config.ci_signs(&role) {
                 let cur = self.require::<TargetsMetadata>(&role)?;
                 let build = targets_builder(cur.targets().clone(), cur.delegations().clone());
-                if self.update(&base, &role, (role_config, previous), now, build)? {
+                if self.update(&base, &role, config, previous, now, build)? {
                     changed.push(role);
                 }
             }
@@ -461,34 +459,22 @@ impl Repo {
 
         let mut meta = HashMap::new();
         for role in self.targets_roles() {
-            let (version, _) = self.header(&role)?.context("vanished")?;
+            let (version, _) = self.require_header(&role)?;
             meta.insert(
                 MetadataPath::new(role)?,
                 MetadataDescription::new(version, None, HashMap::new())?,
             );
         }
         let build = Box::new(move |v, e| SnapshotMetadata::new(v, e, meta.clone(), HashMap::new()));
-        if self.update(
-            &base,
-            "snapshot",
-            (config.role("snapshot")?, previous),
-            now,
-            build,
-        )? {
+        if self.update(&base, "snapshot", config, previous, now, build)? {
             changed.push("snapshot".to_owned());
         }
 
-        let (version, _) = self.header("snapshot")?.context("vanished")?;
+        let (version, _) = self.require_header("snapshot")?;
         let snapshot = MetadataDescription::new(version, None, HashMap::new())?;
         let build =
             Box::new(move |v, e| TimestampMetadata::new(v, e, snapshot.clone(), HashMap::new()));
-        if self.update(
-            &base,
-            "timestamp",
-            (config.role("timestamp")?, previous),
-            now,
-            build,
-        )? {
+        if self.update(&base, "timestamp", config, previous, now, build)? {
             changed.push("timestamp".to_owned());
         }
         Ok(changed)
@@ -510,11 +496,32 @@ impl Repo {
     }
 }
 
+/// Parses signed metadata without checking its signatures.
+pub fn parse_unverified<M: Metadata>(bytes: &[u8]) -> tuf::Result<M> {
+    let raw = RawSignedMetadata::<Pouf1, M>::new(bytes.to_vec());
+    raw.parse_untrusted()?.assume_valid()
+}
+
+/// Threshold and key ids that `root` gives the top-level `role`.
+pub fn root_role_keys<'a>(root: &'a RootMetadata, role: &str) -> (u32, &'a HashSet<KeyId>) {
+    match role {
+        "root" => (root.root().threshold(), root.root().key_ids()),
+        "targets" => (root.targets().threshold(), root.targets().key_ids()),
+        "snapshot" => (root.snapshot().threshold(), root.snapshot().key_ids()),
+        _ => (root.timestamp().threshold(), root.timestamp().key_ids()),
+    }
+}
+
+/// Whether `pattern` is `path`, or ends in `/` and `path` is under it. Clients use this rule.
+pub fn covers(pattern: &TargetPath, path: &TargetPath) -> bool {
+    path == pattern || path.is_child(pattern)
+}
+
 /// The role `path` belongs in under `delegations`: the first whose paths match, the way clients
 /// search them, else `targets`.
 fn delegated_role(delegations: &Delegations, path: &TargetPath) -> String {
     let mut roles = delegations.roles().iter();
-    let found = roles.find(|d| path.matches_chain(&[d.paths().clone()]));
+    let found = roles.find(|d| d.paths().iter().any(|p| covers(p, path)));
     found.map_or("targets", |d| d.name().as_str()).to_owned()
 }
 

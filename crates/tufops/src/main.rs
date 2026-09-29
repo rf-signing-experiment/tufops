@@ -20,6 +20,7 @@ use tufops_core::config::FILE as CONFIG_FILE;
 use tufops_core::git::{Git, MAIN, SIGN_PREFIX};
 use tufops_core::publish::{publish, target_object};
 use tufops_core::repo::METADATA;
+use tufops_core::status::short;
 use tufops_core::{Config, EventStatus, Repo};
 use walkdir::WalkDir;
 
@@ -215,14 +216,6 @@ impl Event {
         })
     }
 
-    fn roles(&self) -> Vec<String> {
-        let roles = self
-            .head
-            .roles()
-            .filter(|r| !matches!(*r, "snapshot" | "timestamp"));
-        roles.map(str::to_owned).collect()
-    }
-
     fn status(&self) -> Result<EventStatus> {
         EventStatus::new(&self.config, &self.base, &self.head)
     }
@@ -240,7 +233,7 @@ impl Event {
         println!(
             "\nYour YubiKey ({}, key {}) is needed to sign {} in {}:",
             self.config.describe_key(&me),
-            me.as_str().get(..8).unwrap_or_default(),
+            short(&me),
             if needed.len() == 1 {
                 "this role"
             } else {
@@ -283,7 +276,7 @@ impl Event {
         paths: &[&str],
         device: Option<u32>,
     ) -> Result<()> {
-        let roles = self.roles();
+        let roles = self.head.event_roles();
         while let Err(err) = sign_online(&self.config, &self.base, &mut self.head, &roles).await {
             ensure!(try_again(&err)?, "online signing failed");
         }
@@ -316,11 +309,8 @@ impl Event {
         }
         let changed_files = self.git.changed_files(&Git::remote_ref(MAIN))?;
         if !status.complete() {
-            let waiting: Vec<_> = status.waiting_for().into_iter().collect();
-            println!(
-                "Waiting for signatures from {}. Track status via PR.",
-                waiting.join(", ")
-            );
+            let waiting = status.waiting_for().join(", ");
+            println!("Waiting for signatures from {waiting}. Track status via PR.");
         } else if status.merges_automatically(&changed_files) {
             println!("All signatures are in: this change will automatically merge");
         } else {

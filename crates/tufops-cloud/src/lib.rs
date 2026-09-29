@@ -26,16 +26,15 @@ pub async fn open_signer(uri: &str) -> Result<Box<dyn Signer>> {
     bail!("unsupported online key {uri}: expected gcpkms:<key version name>")
 }
 
-/// Signs `roles` with each configured online key they still need. Returns the roles signed.
+/// Signs `roles` with each configured online key they still need.
 pub async fn sign_online(
     config: &Config,
     base: &Repo,
     repo: &mut Repo,
     roles: &[String],
-) -> Result<Vec<String>> {
+) -> Result<()> {
     let keys = config.keys_by_id()?;
     let mut signers: HashMap<&str, Box<dyn Signer>> = HashMap::new();
-    let mut signed = vec![];
     for role in roles {
         for key in repo.missing_keys(base, role)? {
             let Some(uri) = keys
@@ -48,10 +47,9 @@ pub async fn sign_online(
                 signers.insert(uri, open_signer(uri).await?);
             }
             repo.sign(role, signers[uri].as_ref()).await?;
-            signed.push(role.clone());
         }
     }
-    Ok(signed)
+    Ok(())
 }
 
 /// Starts and signs new versions of the online roles in the working tree at `dir` that are due.

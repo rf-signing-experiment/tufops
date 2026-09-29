@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use md5::{Digest, Md5};
 use tuf::Database;
-use tuf::crypto::HashAlgorithm;
+use tuf::crypto::{HashAlgorithm, HashValue};
 use tuf::metadata::{
     Metadata, MetadataPath, RawSignedMetadata, TargetDescription, TargetPath, TargetsMetadata,
     TimestampMetadata,
@@ -14,7 +14,7 @@ use tuf::metadata::{
 use tuf::pouf::Pouf1;
 
 use crate::backend::BlobStore;
-use crate::repo::Repo;
+use crate::repo::{Repo, parse_unverified};
 
 pub const METADATA_PREFIX: &str = "metadata/";
 pub const TARGETS_PREFIX: &str = "targets/";
@@ -24,13 +24,16 @@ pub const INDEX_PAGE: &str = "index.html";
 /// The object clients start every update from.
 const TIMESTAMP: &str = "metadata/timestamp.json";
 
+/// A target's SHA-256, the hash tufops records and names uploads by.
+pub fn target_sha256(desc: &TargetDescription) -> Result<&HashValue> {
+    let hash = desc.hashes().get(&HashAlgorithm::Sha256);
+    hash.context("target has no sha256")
+}
+
 /// Object name of a target file: consistent snapshots prefix the file name with its SHA-256.
 pub fn target_object(path: &TargetPath, desc: &TargetDescription) -> Result<String> {
-    let hash = desc
-        .hashes()
-        .get(&HashAlgorithm::Sha256)
-        .context("target has no sha256")?;
-    Ok(format!("{TARGETS_PREFIX}{}", path.with_hash_prefix(hash)?))
+    let name = path.with_hash_prefix(target_sha256(desc)?)?;
+    Ok(format!("{TARGETS_PREFIX}{name}"))
 }
 
 /// Checks the metadata the way a client would: the root chain from version 1, then timestamp,
@@ -39,10 +42,6 @@ pub fn verify(repo: &Repo) -> Result<()> {
     fn raw<M: Metadata>(bytes: &[u8]) -> RawSignedMetadata<Pouf1, M> {
         RawSignedMetadata::new(bytes.to_vec())
     }
-    let get = |role: &str| {
-        repo.raw(role)
-            .with_context(|| format!("{role} metadata is missing"))
-    };
     let now = Utc::now();
 
     let history = repo.root_history()?;
@@ -51,15 +50,16 @@ pub fn verify(repo: &Repo) -> Result<()> {
         db.update_root(&raw(root))
             .with_context(|| format!("root v{}", i + 1))?;
     }
-    db.update_timestamp(&now, &raw(get("timestamp")?))
+    db.update_timestamp(&now, &raw(repo.require_raw("timestamp")?))
         .context("timestamp")?;
-    db.update_snapshot(&now, &raw(get("snapshot")?))
+    db.update_snapshot(&now, &raw(repo.require_raw("snapshot")?))
         .context("snapshot")?;
-    db.update_targets(&now, &raw(get("targets")?))
+    db.update_targets(&now, &raw(repo.require_raw("targets")?))
         .context("targets")?;
     for role in repo.targets_roles().iter().filter(|r| *r != "targets") {
         let path = MetadataPath::new(role.clone())?;
-        db.update_delegated_targets(&now, &MetadataPath::targets(), &path, &raw(get(role)?))
+        let meta = raw(repo.require_raw(role)?);
+        db.update_delegated_targets(&now, &MetadataPath::targets(), &path, &meta)
             .with_context(|| format!("role {role}"))?;
     }
     Ok(())
@@ -79,15 +79,15 @@ fn metadata_objects(repo: &Repo) -> Result<BTreeMap<String, Vec<u8>>> {
         .into_iter()
         .chain(["snapshot".to_owned()])
     {
-        let (version, _) = repo.header(&role)?.context("vanished")?;
+        let (version, _) = repo.require_header(&role)?;
         objects.insert(
             format!("{METADATA_PREFIX}{version}.{role}.json"),
-            repo.raw(&role).unwrap().to_vec(),
+            repo.require_raw(&role)?.to_vec(),
         );
     }
     objects.insert(
         TIMESTAMP.to_owned(),
-        repo.raw("timestamp").context("no timestamp")?.to_vec(),
+        repo.require_raw("timestamp")?.to_vec(),
     );
     Ok(objects)
 }
@@ -99,10 +99,9 @@ async fn check_timestamp(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
     let Some(published) = store.get(TIMESTAMP).await? else {
         return Ok(());
     };
-    let raw = RawSignedMetadata::<Pouf1, TimestampMetadata>::new(published.clone());
-    let parsed = raw.parse_untrusted().and_then(|s| s.assume_valid());
+    let parsed = parse_unverified::<TimestampMetadata>(&published);
     let published_version = parsed.context("parsing the published timestamp")?.version();
-    let (version, _) = repo.header("timestamp")?.context("no timestamp")?;
+    let (version, _) = repo.require_header("timestamp")?;
     ensure!(
         published_version <= version,
         "storage has timestamp version {published_version}, newer than this repository's \
@@ -125,9 +124,7 @@ pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> 
 
     let uploaded = store.list(TARGETS_PREFIX).await?;
     for role in repo.targets_roles() {
-        let targets = repo
-            .metadata::<TargetsMetadata>(&role)?
-            .context("vanished")?;
+        let targets = repo.require::<TargetsMetadata>(&role)?;
         for (path, desc) in targets.targets() {
             let name = target_object(path, desc)?;
             ensure!(

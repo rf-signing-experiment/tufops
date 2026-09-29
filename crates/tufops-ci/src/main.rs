@@ -76,26 +76,16 @@ impl GitHub {
         let (state, description) = if status.complete() {
             (StatusState::Success, "All signatures are in".to_owned())
         } else {
-            let waiting: Vec<_> = status.waiting_for().into_iter().collect();
-            (
-                StatusState::Pending,
-                format!("Waiting for {}", waiting.join(", ")),
-            )
+            let waiting = status.waiting_for().join(", ");
+            (StatusState::Pending, format!("Waiting for {waiting}"))
         };
-        let var = |name| std::env::var(name).unwrap_or_default();
-        let run = format!(
-            "{}/{}/actions/runs/{}",
-            var("GITHUB_SERVER_URL"),
-            var("GITHUB_REPOSITORY"),
-            var("GITHUB_RUN_ID")
-        );
         // GitHub limits status descriptions to 140 characters.
         let description = description.chars().take(140).collect();
         (self.client.repos(&self.owner, &self.repo))
             .create_status(sha.to_owned(), state)
             .context(STATUS_CONTEXT.to_owned())
             .description(description)
-            .target(run)
+            .target(run_url())
             .send()
             .await?;
         Ok(())
@@ -189,12 +179,11 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
             "## Signing event `{branch}`\n\n{}\n",
             markdown(&status, store.as_ref())
         );
-        let waiting: Vec<_> = status.waiting_for().into_iter().collect();
         body.push_str(&if !status.complete() {
             format!(
                 "Waiting for signatures from {}. Signers: check out the repository and run \
                  `tufops sign`.",
-                waiting.join(", ")
+                status.waiting_for().join(", ")
             )
         } else if merge {
             "All signatures are in: merging.".to_owned()
@@ -210,7 +199,7 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         if !merge {
             return Ok(());
         }
-        match git.run(&["push", REMOTE, &format!("HEAD:refs/heads/{MAIN}")]) {
+        match git.push(MAIN, false) {
             Ok(_) => return git.run(&["push", REMOTE, "--delete", &branch]).map(drop),
             Err(err) if attempt < 3 => eprintln!("retrying: {err:#}"),
             Err(err) => return Err(err),
@@ -281,7 +270,7 @@ async fn report_renewals(github: &GitHub, repo: &Repo, roles: &[String]) -> Resu
          with `tufops apply --event renew`.\n\n",
     );
     for role in roles {
-        let (_, expires) = repo.header(role)?.context("vanished")?;
+        let (_, expires) = repo.require_header(role)?;
         let _ = writeln!(body, "- `{role}` expires {}", expires.format("%Y-%m-%d"));
     }
     match issue {
@@ -292,15 +281,16 @@ async fn report_renewals(github: &GitHub, repo: &Repo, roles: &[String]) -> Resu
     Ok(())
 }
 
-async fn report_failure(github: &GitHub) -> Result<()> {
+/// Link to this workflow run.
+fn run_url() -> String {
     let var = |name| std::env::var(name).unwrap_or_default();
-    let run = format!(
-        "{}/{}/actions/runs/{}",
-        var("GITHUB_SERVER_URL"),
-        var("GITHUB_REPOSITORY"),
-        var("GITHUB_RUN_ID")
-    );
-    let body = format!("tufops failed on `{}`: {run}", var("TUFOPS_BRANCH"));
+    let repo = format!("{}/{}", var("GITHUB_SERVER_URL"), var("GITHUB_REPOSITORY"));
+    format!("{repo}/actions/runs/{}", var("GITHUB_RUN_ID"))
+}
+
+async fn report_failure(github: &GitHub) -> Result<()> {
+    let branch = std::env::var("TUFOPS_BRANCH").unwrap_or_default();
+    let body = format!("tufops failed on `{branch}`: {}", run_url());
     let issues = github.client.issues(&github.owner, &github.repo);
     match github.open_issue(FAILURE_TITLE).await? {
         Some(issue) => drop(issues.create_comment(issue.number, body).await?),
@@ -341,7 +331,7 @@ fn markdown(status: &EventStatus, store: &dyn BlobStore) -> String {
                 req.signed.len(),
                 req.threshold,
                 names(&req.signed),
-                names(&req.unsigned),
+                names(req.awaited()),
             );
         }
     }

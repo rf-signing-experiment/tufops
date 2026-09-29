@@ -3,14 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use tuf::crypto::{HashAlgorithm, KeyId, PublicKey};
+use tuf::crypto::{KeyId, PublicKey};
 use tuf::metadata::{RootMetadata, TargetDescription, TargetPath, TargetsMetadata};
 
-use crate::config::Config;
-use crate::publish::target_object;
-use crate::repo::{METADATA, Repo};
+use crate::config::{Config, TOP_LEVEL_ROLES};
+use crate::publish::{target_object, target_sha256};
+use crate::repo::{METADATA, Repo, root_role_keys};
 
 /// A key that signs a role, as the config names it.
 #[derive(Clone, Debug)]
@@ -34,6 +34,11 @@ pub struct Requirement {
 impl Requirement {
     pub fn met(&self) -> bool {
         self.signed.len() as u32 >= self.threshold
+    }
+
+    /// Keys whose signatures are still needed: the unsigned ones, until the threshold is met.
+    pub fn awaited(&self) -> &[Key] {
+        if self.met() { &[] } else { &self.unsigned }
     }
 }
 
@@ -100,8 +105,8 @@ impl RoleStatus {
 
     /// Whether the role still needs a signature from `key`.
     pub fn needs(&self, key: &KeyId) -> bool {
-        let unmet = self.requirements.iter().filter(|r| !r.met());
-        unmet.flat_map(|r| &r.unsigned).any(|k| &k.id == key)
+        let mut awaited = self.requirements.iter().flat_map(Requirement::awaited);
+        awaited.any(|k| &k.id == key)
     }
 }
 
@@ -123,14 +128,8 @@ impl EventStatus {
                 .get(k.key_id())
                 .is_some_and(|(_, conf)| conf.online.is_some()),
         };
-        // Root first, then targets, then delegated roles.
-        let mut names: Vec<_> = head
-            .roles()
-            .filter(|r| !matches!(*r, "snapshot" | "timestamp"))
-            .collect();
-        names.sort_by_key(|r| (*r != "root", *r != "targets", *r));
         let mut roles = vec![];
-        for role in names {
+        for role in &head.event_roles() {
             let changed = base.raw(role) != head.raw(role);
             let mut requirements = vec![];
             for (i, (threshold, role_keys)) in
@@ -146,7 +145,7 @@ impl EventStatus {
                     unsigned: unsigned.into_iter().map(key).collect(),
                 });
             }
-            let (version, expires) = head.header(role)?.context("vanished")?;
+            let (version, expires) = head.require_header(role)?;
             let changes = if changed {
                 changes(config, (base, &base_index), (head, &head_index), role)?
             } else {
@@ -192,21 +191,17 @@ impl EventStatus {
             .any(|k| !k.online)
     }
 
-    /// Names of the keys whose signatures are still needed.
-    pub fn waiting_for(&self) -> BTreeSet<&str> {
-        let unmet = self
-            .roles
-            .iter()
-            .flat_map(|r| &r.requirements)
-            .filter(|r| !r.met());
-        unmet
-            .flat_map(|r| &r.unsigned)
-            .map(|k| k.name.as_str())
-            .collect()
+    /// Names of the keys whose signatures are still needed, sorted and without duplicates.
+    pub fn waiting_for(&self) -> Vec<&str> {
+        let reqs = self.roles.iter().flat_map(|r| &r.requirements);
+        let awaited = reqs.flat_map(Requirement::awaited);
+        let names: BTreeSet<_> = awaited.map(|k| k.name.as_str()).collect();
+        names.into_iter().collect()
     }
 }
 
-fn short(id: &KeyId) -> &str {
+/// The start of a key id, enough to tell keys apart.
+pub fn short(id: &KeyId) -> &str {
     id.as_str().get(..8).unwrap_or(id.as_str())
 }
 
@@ -217,9 +212,7 @@ type TargetIndex = HashMap<TargetPath, Vec<(String, TargetDescription)>>;
 fn index_targets(repo: &Repo) -> Result<TargetIndex> {
     let mut index = TargetIndex::new();
     for role in repo.targets_roles() {
-        let targets = repo
-            .metadata::<TargetsMetadata>(&role)?
-            .context("vanished")?;
+        let targets = repo.require::<TargetsMetadata>(&role)?;
         for (path, desc) in targets.targets() {
             index
                 .entry(path.clone())
@@ -238,43 +231,14 @@ fn changes(
 ) -> Result<Vec<Change>> {
     let mut out = vec![];
     if role == "root" {
-        let new = head.root()?;
-        let old = base.metadata::<RootMetadata>(role)?;
-        let defs = |r: &RootMetadata| {
-            [
-                ("root", r.root().threshold(), r.root().key_ids().clone()),
-                (
-                    "targets",
-                    r.targets().threshold(),
-                    r.targets().key_ids().clone(),
-                ),
-                (
-                    "snapshot",
-                    r.snapshot().threshold(),
-                    r.snapshot().key_ids().clone(),
-                ),
-                (
-                    "timestamp",
-                    r.timestamp().threshold(),
-                    r.timestamp().key_ids().clone(),
-                ),
-            ]
-        };
-        let old_defs = old.as_ref().map(defs);
-        for (i, (role, threshold, ids)) in defs(&new).iter().enumerate() {
-            let old = old_defs.as_ref().map(|d| (d[i].1, &d[i].2));
-            key_changes(
-                &mut out,
-                config,
-                &format!("{role} role"),
-                old,
-                (*threshold, ids),
-            );
+        let (new, old) = (head.root()?, base.metadata::<RootMetadata>(role)?);
+        for top in TOP_LEVEL_ROLES {
+            let what = format!("{top} role");
+            let old = old.as_ref().map(|o| root_role_keys(o, top));
+            key_changes(&mut out, config, &what, old, root_role_keys(&new, top));
         }
     } else {
-        let new = head
-            .metadata::<TargetsMetadata>(role)?
-            .context("vanished")?;
+        let new = head.require::<TargetsMetadata>(role)?;
         let old = base.metadata::<TargetsMetadata>(role)?;
         let by_name = |t: &TargetsMetadata| -> BTreeMap<String, _> {
             let roles = t.delegations().roles().iter();
@@ -310,15 +274,10 @@ fn changes(
         let empty = HashMap::new();
         let old_targets = old.as_ref().map_or(&empty, |o| o.targets());
         let file = |path: &TargetPath, d: &TargetDescription| -> Result<_> {
-            let sha256 = d
-                .hashes()
-                .get(&HashAlgorithm::Sha256)
-                .context("no sha256")?;
-            let object = target_object(path, d)?;
             Ok(Some(TargetFile {
                 length: d.length(),
-                sha256: sha256.to_string(),
-                object,
+                sha256: target_sha256(d)?.to_string(),
+                object: target_object(path, d)?,
             }))
         };
         // Another role listing the same file: where it moved from, or to, unchanged.
