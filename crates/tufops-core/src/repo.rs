@@ -383,6 +383,22 @@ impl Repo {
         Ok(delegated_role(self.targets()?.delegations(), path))
     }
 
+    /// Every target that `targets` and the roles delegated from it list, with its description.
+    /// Should a path somehow be listed twice, the role it belongs in gives the description.
+    pub fn listed_targets(&self) -> Result<HashMap<TargetPath, TargetDescription>> {
+        let top = self.targets()?;
+        let mut listed = HashMap::new();
+        for role in self.targets_roles() {
+            let targets = self.require::<TargetsMetadata>(&role)?;
+            for (path, desc) in targets.targets() {
+                if delegated_role(top.delegations(), path) == role || !listed.contains_key(path) {
+                    listed.insert(path.clone(), desc.clone());
+                }
+            }
+        }
+        Ok(listed)
+    }
+
     /// Adds or replaces targets, in the roles their paths belong in. Returns the roles changed.
     pub fn add_targets(
         &mut self,
@@ -409,22 +425,20 @@ impl Repo {
         Ok(changed)
     }
 
-    /// Removes the targets matching `patterns` from every role listing them: a pattern matches
-    /// itself and, if it ends in `/`, everything under it, like delegation paths. Returns the
-    /// roles changed and how many targets were removed.
+    /// Removes the targets `remove` picks from every role listing them. Returns the roles changed
+    /// and how many targets were removed.
     pub fn remove_targets(
         &mut self,
         config: &Config,
         base: &Repo,
-        patterns: &[TargetPath],
+        remove: impl Fn(&TargetPath) -> bool,
         now: DateTime<Utc>,
     ) -> Result<(Vec<String>, usize)> {
-        let matches = |path: &TargetPath| patterns.iter().any(|p| covers(p, path));
         let (mut changed, mut removed) = (vec![], 0);
         for role in self.targets_roles() {
             let cur = self.require::<TargetsMetadata>(&role)?;
             let mut map = cur.targets().clone();
-            map.retain(|path, _| !matches(path));
+            map.retain(|path, _| !remove(path));
             if map.len() == cur.targets().len() {
                 continue;
             }

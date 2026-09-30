@@ -375,6 +375,7 @@ clients as their trusted root.
 ```sh
 tufops add --from ./build/fw-1.2.bin --to firmware/fw-1.2.bin
 tufops add --from ./build/out/ --to nightly/2026-09-23/        # a whole directory
+tufops add --from ./build/out/ --to nightly/latest/ --delete   # make nightly/latest/ match it
 ```
 
 `add`:
@@ -382,12 +383,23 @@ tufops add --from ./build/out/ --to nightly/2026-09-23/        # a whole directo
 1. Checks out the signing event (by default `sign/add-<to>`; pass `--event` to pick one, or to
    add several things to one event). An existing event on the remote is continued (see
    below).
-2. Hashes each file and uploads it to `targets/<dir>/<sha256>.<name>` in the bucket. Clients
-   can't see it until metadata that lists it is published.
-3. Adds each file to the role whose `paths` match it, or to `targets` if none match.
+2. Hashes each file and compares it with the metadata. Files the repository already lists at
+   the same path with the same SHA-256 are skipped. The rest are uploaded to
+   `targets/<dir>/<sha256>.<name>` in the bucket. Clients can't see them until metadata that
+   lists them is published.
+3. Adds each new or changed file to the role whose `paths` match it, or to `targets` if none
+   match.
 4. Signs with the online keys those roles need. If your YubiKey is plugged in and needed, it
    shows what you would sign and asks before signing (see §5).
 5. Commits and pushes the event, then prints its status.
+
+**Making a directory match.** With `--delete`, `add` also removes the targets in the `--to`
+directory that `--from` lacks, so the directory ends up with exactly the files of `--from`.
+`--to` is a directory when it ends in `/` or `--from` is one, and `--to /` makes the whole
+repository match. As with `tufops rm`, the removed files stay in the bucket. Because unchanged
+files are skipped, rerunning `add --delete`, say from a nightly job, only uploads what changed.
+
+**Previewing.** `--dry-run` lists what `add` would add, change and remove.
 
 For a role signed only by online keys, CI merges and publishes straight away. For an offline
 role, CI opens a pull request. The signers sign it, then a maintainer merges it.
@@ -575,7 +587,7 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 |---|---|
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
-| `tufops add --from PATH --to PATH [--event NAME] [--restart]` | Upload artifacts and add them in a signing event. |
+| `tufops add --from PATH --to PATH [--delete] [--dry-run] [--event NAME] [--restart]` | Upload new and changed artifacts and add them in a signing event; `--delete` also removes targets `--from` lacks, `--dry-run` only lists the changes. |
 | `tufops rm PATH… [--event NAME] [--restart]` | Remove targets (a path ending in `/` removes everything under it) in a signing event; their uploads are kept. |
 | `tufops apply [--event NAME] [--restart]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
 | `tufops online [--push]` | On `main`: sign new versions that are due of the roles CI signs. |

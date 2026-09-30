@@ -17,6 +17,15 @@ pub struct Git {
     dir: PathBuf,
 }
 
+/// Why signing event `branch` can't be continued: it conflicts with main.
+fn stale(branch: &str) -> String {
+    format!(
+        "{branch} conflicts with {MAIN}, so it was probably merged or abandoned: use another \
+         event name, or pass --restart to start it over from {MAIN}, discarding its changes and \
+         signatures"
+    )
+}
+
 impl Git {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -143,13 +152,7 @@ impl Git {
             return Ok(branch);
         }
         // Check the merge before touching the working tree, which may hold tufops.toml edits.
-        let stale = format!(
-            "{branch} conflicts with {MAIN}, so it was probably merged or abandoned: use another \
-             event name, or pass --restart to start it over from {MAIN}, discarding its changes \
-             and signatures"
-        );
-        let merge = self.output(&["merge-tree", "--write-tree", &remote, &main])?;
-        ensure!(merge.status.success(), "{stale}");
+        self.merged_tree(&branch)?;
         if local {
             self.run(&["checkout", "--quiet", &branch])?;
             self.run(&["merge", "--quiet", "--ff-only", &remote])?;
@@ -159,9 +162,32 @@ impl Git {
         let message = format!("Merge {MAIN} into {branch}");
         if let Err(err) = self.run(&["merge", "--quiet", "--no-edit", "-m", &message, &main]) {
             let _ = self.run(&["merge", "--abort"]);
-            return Err(err.context(stale));
+            return Err(err.context(stale(&branch)));
         }
         Ok(branch)
+    }
+
+    /// The revision holding the metadata `checkout_event` would start event `event` from, found
+    /// without touching the working tree or any branch: the remote main branch for a new or
+    /// restarted event, else the remote event merged with it. Unpushed local commits are left
+    /// out.
+    pub fn preview_event(&self, event: &str, restart: bool) -> Result<String> {
+        self.fetch()?;
+        let branch = format!("{SIGN_PREFIX}{event}");
+        if restart || !self.rev_exists(&Self::remote_ref(&branch))? {
+            return Ok(Self::remote_ref(MAIN));
+        }
+        self.merged_tree(&branch)
+    }
+
+    /// The tree of the remote main branch merged into the remote `branch`, without touching the
+    /// working tree. Fails if they conflict.
+    fn merged_tree(&self, branch: &str) -> Result<String> {
+        let (remote, main) = (Self::remote_ref(branch), Self::remote_ref(MAIN));
+        let merge = self.output(&["merge-tree", "--write-tree", &remote, &main])?;
+        ensure!(merge.status.success(), "{}", stale(branch));
+        let out = String::from_utf8_lossy(&merge.stdout);
+        Ok(out.lines().next().unwrap_or_default().to_owned())
     }
 
     /// Commits all changes under `paths`, returning false if there were none.

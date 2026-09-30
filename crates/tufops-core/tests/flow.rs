@@ -17,6 +17,7 @@ use tuf::repository::{EphemeralRepository, RepositoryStorage};
 use tufops_core::backend::{BlobStore, Signer};
 use tufops_core::config::TOP_LEVEL_ROLES;
 use tufops_core::publish::{self, target_object};
+use tufops_core::repo::covers;
 use tufops_core::{Config, EventStatus, Repo};
 
 struct TestKey(EcdsaPrivateKey);
@@ -419,9 +420,10 @@ async fn delegated_paths() {
             .unwrap();
     }
     let changed = repo
-        .add_targets(&config, &repo.clone(), files, now)
+        .add_targets(&config, &repo.clone(), files.clone(), now)
         .unwrap();
     assert_eq!(changed, ["alpha", "beta", "targets"]);
+    assert_eq!(repo.listed_targets().unwrap(), files.into_iter().collect());
     publish(&mut repo, &config).await;
     assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
 
@@ -483,7 +485,8 @@ async fn delegated_paths() {
     // stay, but clients no longer find them.
     let main = repo.clone();
     let remove = ["b/one/", "z", "nothing/"].map(|p| TargetPath::new(p).unwrap());
-    let (changed, removed) = repo.remove_targets(&config, &main, &remove, now).unwrap();
+    let matches = |path: &TargetPath| remove.iter().any(|p| covers(p, path));
+    let (changed, removed) = repo.remove_targets(&config, &main, matches, now).unwrap();
     assert_eq!(
         (changed, removed),
         (vec!["alpha".into(), "beta-one".into()], 2)
@@ -493,13 +496,19 @@ async fn delegated_paths() {
     publish(&mut repo, &config).await;
     let found = client_finds(&repo, &store, &paths).await;
     assert_eq!(found, [true, true, false, true, false]);
-    let none = [TargetPath::new("nothing/").unwrap()];
+    let nothing = TargetPath::new("nothing/").unwrap();
     assert_eq!(
         repo.clone()
-            .remove_targets(&config, &repo, &none, now)
+            .remove_targets(&config, &repo, |p| covers(&nothing, p), now)
             .unwrap()
             .1,
         0
+    );
+    let mut listed: Vec<_> = repo.listed_targets().unwrap().into_keys().collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        ["a/x", "b/two/q", "b/y"].map(|p| TargetPath::new(p).unwrap())
     );
 
     // Paths that more than one role covers are rejected; a mere common prefix is fine.
