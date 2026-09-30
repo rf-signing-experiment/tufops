@@ -15,7 +15,7 @@ use tufops_core::publish::{target_object, target_sha256};
 use tufops_core::repo::METADATA;
 use walkdir::WalkDir;
 
-use crate::event::{EventArgs, slug};
+use crate::event::{Event, slug};
 use crate::try_again;
 
 /// A file to add: its target path, where it is locally, and its description.
@@ -179,30 +179,21 @@ async fn upload(
 
 /// Adds the files of `from` to the repository at `to`, skipping those it already lists with the
 /// same SHA-256. With `delete`, also removes the targets in the `to` directory that `from`
-/// lacks. With `dry_run`, only lists the changes, compared with the metadata the event would
-/// start from.
+/// lacks. With `dry_run`, only lists the changes.
 pub async fn add(
     dir: &Path,
     from: &Path,
     to: &str,
     delete: bool,
     dry_run: bool,
-    event: EventArgs,
     device: Option<u32>,
 ) -> Result<()> {
     let files = collect_files(from, to)?;
     let delete_in = if delete { target_dir(from, to) } else { None };
-    let name = format!("add-{}", slug(to));
-    if dry_run {
-        let listed = event.preview(dir, &name)?.listed_targets()?;
-        Plan::new(&listed, files, delete_in.as_deref()).print(true);
-        return Ok(());
-    }
-    let mut ev = event.open(dir, &name)?;
+    let mut ev = Event::start(dir, &format!("add-{}", slug(to)))?;
     let plan = Plan::new(&ev.head.listed_targets()?, files, delete_in.as_deref());
-    plan.print(false);
-    // Starting over still pushes, to replace the event on the remote.
-    if plan.is_empty() && !ev.restart {
+    plan.print(dry_run);
+    if dry_run || plan.is_empty() {
         return Ok(());
     }
     let message = match plan.removed.len() {

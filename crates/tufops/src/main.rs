@@ -23,7 +23,7 @@ use tufops_core::publish::publish;
 use tufops_core::repo::{METADATA, covers};
 use tufops_core::{Config, EventStatus, Repo};
 
-use crate::event::{Event, EventArgs, slug};
+use crate::event::{Event, slug, started_from};
 use crate::yubikey::YubiKeySigner;
 
 #[derive(Debug, Parser)]
@@ -48,7 +48,7 @@ enum Command {
         /// Signing events to sign (without `sign/`); asks when omitted.
         events: Vec<String>,
     },
-    /// Upload new and changed artifacts and add them to the repository in a signing event.
+    /// Upload new and changed artifacts and add them to the repository in a new signing event.
     Add {
         /// Local file or directory to add.
         #[arg(long)]
@@ -60,32 +60,22 @@ enum Command {
         /// `--from` exactly; their uploads are kept.
         #[arg(long)]
         delete: bool,
-        /// List what would be added, changed and removed, without checking out, uploading,
-        /// signing or pushing anything.
+        /// List what would be added, changed and removed, without uploading, signing or pushing
+        /// anything.
         #[arg(long)]
         dry_run: bool,
-        #[command(flatten)]
-        event: EventArgs,
     },
-    /// Remove artifacts from the repository in a signing event; their uploads are kept.
+    /// Remove artifacts from the repository in a new signing event; their uploads are kept.
     Rm {
         /// Target paths to remove; a path ending in `/` removes everything under it.
         #[arg(required = true)]
         paths: Vec<String>,
-        #[command(flatten)]
-        event: EventArgs,
     },
-    /// Update the metadata to match tufops.toml, in a signing event.
-    Apply {
-        #[command(flatten)]
-        event: EventArgs,
-    },
-    /// Start and sign new snapshot and timestamp versions on main if due (normally done by CI).
-    Online {
-        /// Push the result to the remote main branch.
-        #[arg(long)]
-        push: bool,
-    },
+    /// Update the metadata to match your edits to tufops.toml, in a new signing event.
+    Apply,
+    /// Start, sign and push new snapshot and timestamp versions on main if due (normally done by
+    /// CI).
+    Online,
     /// Publish the checked out metadata to storage (normally done by CI).
     Publish,
     /// Print a public key in the form tufops.toml takes.
@@ -103,6 +93,11 @@ async fn main() -> Result<()> {
     debug!(?cli, "tufops {}", env!("CARGO_PKG_VERSION"));
     let dir = cli.repo.as_path();
     let device = cli.device;
+    // Changes start from main as everyone sees it, and are made in temporary worktrees, so the
+    // checkout itself stays as it is.
+    if !matches!(cli.command, Command::Pubkey { .. }) {
+        Git::new(dir).check_main()?;
+    }
     match cli.command {
         Command::Status => status(dir),
         Command::Sign { events } => sign(dir, events, device).await,
@@ -111,38 +106,37 @@ async fn main() -> Result<()> {
             to,
             delete,
             dry_run,
-            event,
-        } => add::add(dir, &from, &to, delete, dry_run, event, device).await,
-        Command::Rm { paths, event } => rm(dir, &paths, event, device).await,
-        Command::Apply { event } => {
-            let mut ev = event.open(dir, "config")?;
-            // Uncommitted edits to tufops.toml are what is being applied; the committed config is
+        } => add::add(dir, &from, &to, delete, dry_run, device).await,
+        Command::Rm { paths } => rm(dir, &paths, device).await,
+        Command::Apply => {
+            // The checkout's edits to tufops.toml are what is being applied; main's config is
             // what the metadata was built from.
-            let previous = Config::load_rev(&ev.git, "HEAD")
-                .inspect_err(|err| debug!("no previous config: {err:#}"))
-                .ok();
+            let config = Config::load(dir)?;
+            let mut ev = Event::start(dir, "config")?;
+            std::fs::copy(dir.join(CONFIG_FILE), ev.worktree.dir().join(CONFIG_FILE))?;
             ev.head
-                .apply_config(&ev.config, previous.as_ref(), &ev.base, Utc::now())?;
+                .apply_config(&config, Some(&ev.config), &ev.base, Utc::now())?;
+            ev.config = config;
             ev.sign_and_finish("Apply tufops.toml", &[METADATA, CONFIG_FILE], device)
                 .await
         }
-        Command::Online { push } => {
-            let git = Git::new(dir);
-            ensure!(git.current_branch()? == MAIN, "check out {MAIN} first");
-            let previous = Config::load_rev(&git, "HEAD^")
+        Command::Online => {
+            let worktree = Git::new(dir).worktree(&Git::remote_ref(MAIN))?;
+            let previous = Config::load_rev(&worktree, "HEAD^")
                 .inspect_err(|err| debug!("no previous config: {err:#}"))
                 .ok();
-            let config = Config::load(dir)?;
-            let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
+            let config = Config::load(worktree.dir())?;
+            let changed =
+                tufops_cloud::update_online(&worktree, &config, previous.as_ref()).await?;
             if changed.is_empty() {
                 println!("Online roles are up to date.");
                 return Ok(());
             }
-            println!("Signed new versions of {}.", changed.join(", "));
-            if push {
-                git.push(MAIN, false)?;
-                println!("Pushed {MAIN}.");
-            }
+            worktree.push(MAIN)?;
+            println!(
+                "Signed new versions of {} and pushed {MAIN}.",
+                changed.join(", ")
+            );
             Ok(())
         }
         Command::Publish => {
@@ -198,12 +192,11 @@ fn try_again(err: &anyhow::Error) -> Result<bool> {
 
 /// Status of every open signing event on the remote.
 fn event_statuses(git: &Git) -> Result<Vec<(String, EventStatus)>> {
-    git.fetch()?;
-    let base = Repo::load_rev(git, &Git::remote_ref(MAIN))?;
     let mut statuses = vec![];
     for event in git.remote_events()? {
         let rev = Git::remote_ref(&format!("{SIGN_PREFIX}{event}"));
         let config = Config::load_rev(git, &rev)?;
+        let base = started_from(git, &rev)?;
         let status = EventStatus::new(&config, &base, &Repo::load_rev(git, &rev)?)?;
         statuses.push((event, status));
     }
@@ -257,7 +250,7 @@ async fn sign(dir: &Path, mut events: Vec<String>, device: Option<u32>) -> Resul
     }
 
     for event in events {
-        let mut ev = Event::open(dir, &event, false)?;
+        let mut ev = Event::open(dir, &event)?;
         if ev.sign_offline(&yubikey).await? {
             let message = format!("Sign with {}", ev.config.describe_key(&me));
             ev.finish(&message, &[METADATA])?;
@@ -266,12 +259,12 @@ async fn sign(dir: &Path, mut events: Vec<String>, device: Option<u32>) -> Resul
     Ok(())
 }
 
-async fn rm(dir: &Path, paths: &[String], event: EventArgs, device: Option<u32>) -> Result<()> {
+async fn rm(dir: &Path, paths: &[String], device: Option<u32>) -> Result<()> {
     let patterns: Vec<_> = paths
         .iter()
         .map(|p| TargetPath::new(p.clone()).with_context(|| format!("target path {p}")))
         .collect::<Result<_>>()?;
-    let mut ev = event.open(dir, &format!("rm-{}", slug(&paths[0])))?;
+    let mut ev = Event::start(dir, &format!("rm-{}", slug(&paths[0])))?;
     // A path ending in `/` also matches everything under it, like delegation paths.
     let matches = |path: &TargetPath| patterns.iter().any(|p| covers(p, path));
     let (changed, removed) = ev

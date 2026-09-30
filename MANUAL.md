@@ -50,8 +50,10 @@ it, so you can keep, say, a release process's key away from CI (§3.1, §7).
 
 A signing event is a `sign/<name>` branch that changes metadata. It goes through these steps:
 
-1. Someone runs `tufops add` or `tufops apply`. The CLI makes the change, signs it with every
-   online key it needs, and with your YubiKey if it needs yours. It then pushes the branch.
+1. Someone runs `tufops add` or `tufops apply` in a checkout of `main` that is up to date. The
+   CLI starts a new event from `main`, named after the change and the time. It makes the change
+   in a temporary worktree, so the checkout stays on `main`, signs it with every online key it
+   needs, and with your YubiKey if it needs yours. It then pushes the branch.
 2. CI works out what the event changes and whose signatures are still missing:
    * If only online keys sign the event, all their signatures are in, and only `metadata/`
      changed, CI merges it into `main`. Online-only changes therefore go live without a pull
@@ -204,9 +206,9 @@ able to push to a protected `main`.
      `timestamp` and merge signing events. Also add whoever merges changes other than metadata,
      for example the **Repository admin** role, with **For pull requests only**.
 7. Under **Settings → General → Pull Requests**, turn on **Automatically delete head
-   branches**, so a merged signing event's branch goes away and the next event with the same
-   name starts afresh. CI also deletes `sign/*` branches whose pull request was merged, in case
-   the setting is off.
+   branches**, so a merged signing event's branch goes away and CI can start the next
+   `sign/refresh`. CI also deletes `sign/*` branches whose pull request was merged, in case the
+   setting is off.
 
 Security notes:
 
@@ -361,13 +363,13 @@ jobs:
 Commit these files to `main` and push. Then create the first metadata:
 
 ```sh
-tufops apply --event init
+tufops apply
 ```
 
-This creates `root`, `targets` and the delegated roles on `sign/init`. The CLI signs `nightly`
-with the online key, and signs with your YubiKey if it is plugged in and needed. The other
-signers run `tufops sign` (§5). When the thresholds are met, a maintainer merges the `sign/init`
-pull request, and CI creates `snapshot` and `timestamp` and publishes. Hand `metadata/root_history/1.root.json` to your
+This creates `root`, `targets` and the delegated roles in a signing event, `sign/config-<time>`.
+The CLI signs `nightly` with the online key, and signs with your YubiKey if it is plugged in and
+needed. The other signers run `tufops sign` (§5). When the thresholds are met, a maintainer
+merges its pull request, and CI creates `snapshot` and `timestamp` and publishes. Hand `metadata/root_history/1.root.json` to your
 clients as their trusted root.
 
 ## 4. Adding and changing files
@@ -380,9 +382,7 @@ tufops add --from ./build/out/ --to nightly/latest/ --delete   # make nightly/la
 
 `add`:
 
-1. Checks out the signing event (by default `sign/add-<to>`; pass `--event` to pick one, or to
-   add several things to one event). An existing event on the remote is continued (see
-   below).
+1. Starts a new signing event, `sign/add-<to>-<time>`, from `main` in a temporary worktree.
 2. Hashes each file and compares it with the metadata. Files the repository already lists at
    the same path with the same SHA-256 are skipped. The rest are uploaded to
    `targets/<dir>/<sha256>.<name>` in the bucket. Clients can't see them until metadata that
@@ -415,23 +415,17 @@ tufops rm firmware/fw-1.1.bin
 tufops rm nightly/2026-09-01/ nightly/2026-09-02/
 ```
 
-`rm` removes each matching target from whichever role lists it, in a signing event (by default
-`sign/rm-<first path>`; `--event` and `--restart` work as for `add`). It signs and pushes like
-`add`, and the status lists each removed target. The uploaded files stay in the bucket, so
+`rm` removes each matching target from whichever role lists it, in a new signing event,
+`sign/rm-<first path>-<time>`. It signs and pushes like `add`, and the status lists each removed
+target. The uploaded files stay in the bucket, so
 clients holding older metadata can still download them.
 
 If an upload or signature fails, tufops shows the error and asks whether to **try again** or
 **give up**. You can fix the problem (log in to `gcloud`, re-plug the YubiKey) and continue
 without starting over. Nothing is pushed until the end.
 
-**Continuing and restarting events.** When `add`, `apply` or `sign` picks up an event that
-already exists on the remote, it first merges the current `main` into it, so every change
-builds on the latest metadata. If that merge conflicts, the event is stale: usually it was
-merged already, or it was abandoned. Nothing is checked out, and tufops tells you to either:
-
-* pick a new event name with `--event`, or
-* pass `--restart` to `add` or `apply` to start the event over from `main`. This replaces the
-  event on the remote and discards its earlier changes and signatures.
+Every change gets its own event. If an event conflicts with something merged into `main` since
+it started, CI says so: make the change again, which starts a new event, and delete the old one.
 
 ## 5. Signing with a YubiKey
 
@@ -458,7 +452,7 @@ tufops sign          # sign the ones that need your YubiKey
 For example:
 
 ```
-Your YubiKey (@alice, key 7f465af1) is needed to sign this role in sign/add-firmware-fw-1.2.bin:
+Your YubiKey (@alice, key 7f465af1) is needed to sign this role in sign/add-firmware-fw-1.2.bin-20260923-103312:
   firmware  version 3 → 4, expires 2026-12-23 03:33 UTC
     target firmware/fw-1.2.bin added (1048576 bytes, sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08)
 Sign? [y/n]
@@ -467,7 +461,8 @@ Sign? [y/n]
 On a wrong PIN the prompt tells you how many tries are left. Choose **Try again** to re-enter it.
 Choose **Give up** to skip that role. The rest of the event is still pushed.
 
-You can also name events: `tufops sign add-firmware-fw-1.2.bin`.
+You can also name events, as `tufops status` shows them:
+`tufops sign add-firmware-fw-1.2.bin-20260923-103312`.
 
 With several YubiKeys plugged in, tufops asks which to use, or you can pick one by serial
 number with `--device` (it is printed on the key, and `ykman list --serials` shows it):
@@ -478,11 +473,12 @@ number with `--device` (it is printed on the key, and `ykman list --serials` sho
 Edit `tufops.toml`, then run:
 
 ```sh
-tufops apply --event rotate-bob     # any event name
+tufops apply
 ```
 
-`apply` carries your uncommitted `tufops.toml` edits onto the event branch. It rewrites the
-metadata to match: keys, thresholds, and delegated roles and their paths. Any role whose
+`apply` copies your uncommitted `tufops.toml` edits into a new event, `sign/config-<time>`, and
+leaves them in your checkout: drop them (`git checkout tufops.toml`) before pulling the merged
+event. It rewrites the metadata to match: keys, thresholds, and delegated roles and their paths. Any role whose
 metadata changes gets a new version that its keys must sign. It then signs, commits (the
 metadata and `tufops.toml`) and pushes like `add`. Typical changes:
 
@@ -523,8 +519,8 @@ once it is within `signing_days` of expiring:
 * **Roles CI signs** (timestamp, snapshot, and roles signed only by their keys): CI re-signs
   them on its schedule and publishes.
 * **Other online roles**: CI opens an issue titled "tufops roles need renewing". Someone with
-  their keys runs `tufops apply --event renew`, which starts and signs the new versions, and CI
-  merges the event. `apply` renews every role that is due, so if offline roles are due too,
+  their keys runs `tufops apply`, which starts and signs the new versions, and CI merges the
+  event. `apply` renews every role that is due, so if offline roles are due too,
   merge `sign/refresh` first.
 * **Offline roles**: CI opens a signing event called `sign/refresh` with the new versions, and
   signers sign it like any other.
@@ -552,8 +548,9 @@ already open.
 You can do the online steps by hand from a `main` checkout:
 
 ```sh
-tufops online --push     # sign new versions of the roles CI signs, if due
-tufops publish           # verify and upload
+tufops online     # sign new versions of the roles CI signs, if due, and push them
+git pull
+tufops publish    # verify and upload
 ```
 
 ## 8. Reference
@@ -587,15 +584,16 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 |---|---|
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
-| `tufops add --from PATH --to PATH [--delete] [--dry-run] [--event NAME] [--restart]` | Upload new and changed artifacts and add them in a signing event; `--delete` also removes targets `--from` lacks, `--dry-run` only lists the changes. |
-| `tufops rm PATH… [--event NAME] [--restart]` | Remove targets (a path ending in `/` removes everything under it) in a signing event; their uploads are kept. |
-| `tufops apply [--event NAME] [--restart]` | Update metadata to match `tufops.toml` in a signing event (default `config`). |
-| `tufops online [--push]` | On `main`: sign new versions that are due of the roles CI signs. |
+| `tufops add --from PATH --to PATH [--delete] [--dry-run]` | Upload new and changed artifacts and add them in a new signing event; `--delete` also removes targets `--from` lacks, `--dry-run` only lists the changes. |
+| `tufops rm PATH…` | Remove targets (a path ending in `/` removes everything under it) in a new signing event; their uploads are kept. |
+| `tufops apply` | Update metadata to match your `tufops.toml` edits in a new signing event. |
+| `tufops online` | Sign new versions that are due of the roles CI signs, and push them to `main`. |
 | `tufops publish` | Verify the checkout and upload changed metadata. |
 | `tufops pubkey [--online URI]` | Print the YubiKey's or a KMS key's public key. |
 
 All commands take `--repo <path>` (default `.`) and `--device <serial number>`, the YubiKey to
-use when several are plugged in.
+use when several are plugged in. All but `pubkey` need `main` checked out and up to date with
+`origin/main`.
 
 To see what tufops does, for example when a command fails in a way you don't understand, set
 `TUFOPS_LOG`: `TUFOPS_LOG=tufops=debug tufops sign` logs every git command, storage upload and

@@ -1,15 +1,16 @@
-//! Signing events: checking one out, signing it with online keys and the YubiKey, and pushing it.
+//! Signing events: making or signing one in a temporary worktree, so the user's checkout stays on
+//! main, signing it with online keys and the YubiKey, and pushing it.
 
 use std::io::stdout;
 use std::path::Path;
 
 use anyhow::{Result, ensure};
-use clap::Args;
+use chrono::Utc;
 use console::style;
 use dialoguer::Confirm;
 use tufops_cloud::sign_online;
 use tufops_core::backend::Signer;
-use tufops_core::git::{Git, MAIN};
+use tufops_core::git::{Git, MAIN, SIGN_PREFIX, Worktree};
 use tufops_core::status::short;
 use tufops_core::{Config, EventStatus, Repo};
 
@@ -17,58 +18,37 @@ use crate::try_again;
 use crate::ui;
 use crate::yubikey::YubiKeySigner;
 
-/// The signing event a command makes its change in.
-#[derive(Args, Debug)]
-pub struct EventArgs {
-    /// Signing event to make the change in (without `sign/`); defaults to one named after the
-    /// change.
-    #[arg(long)]
-    event: Option<String>,
-    /// Start the event over from main, discarding its earlier changes and signatures.
-    #[arg(long)]
-    restart: bool,
-}
-
-impl EventArgs {
-    /// Checks out the event, named `default` unless `--event` names one.
-    pub fn open(&self, dir: &Path, default: &str) -> Result<Event> {
-        Event::open(dir, self.event.as_deref().unwrap_or(default), self.restart)
-    }
-
-    /// The metadata `open` would start from, without checking anything out.
-    pub fn preview(&self, dir: &Path, default: &str) -> Result<Repo> {
-        let git = Git::new(dir);
-        let event = self.event.as_deref().unwrap_or(default);
-        Repo::load_rev(&git, &git.preview_event(event, self.restart)?)
-    }
-}
-
-/// A signing event checked out in the working tree.
+/// A signing event checked out in a temporary worktree.
 pub struct Event {
-    pub git: Git,
+    pub worktree: Worktree,
     branch: String,
     pub config: Config,
-    /// The remote main branch the event will be merged into.
+    /// The main commit the event started from.
     pub base: Repo,
     pub head: Repo,
-    /// Whether the event started over, so pushing it replaces the remote branch.
-    pub restart: bool,
 }
 
 impl Event {
-    pub fn open(dir: &Path, name: &str, restart: bool) -> Result<Self> {
+    /// Starts a new event from main, named after `kind` and the time so the name is new.
+    pub fn start(dir: &Path, kind: &str) -> Result<Self> {
+        let name = format!("{kind}-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+        Self::checkout(dir, &name, &Git::remote_ref(MAIN))
+    }
+
+    /// Opens the event `name` as the remote has it.
+    pub fn open(dir: &Path, name: &str) -> Result<Self> {
+        Self::checkout(dir, name, &Git::remote_ref(&format!("{SIGN_PREFIX}{name}")))
+    }
+
+    fn checkout(dir: &Path, name: &str, rev: &str) -> Result<Self> {
         let git = Git::new(dir);
-        let branch = git.checkout_event(name, restart)?;
-        if restart {
-            println!("Starting {branch} over from {MAIN}.");
-        }
+        let worktree = git.worktree(rev)?;
         Ok(Self {
-            base: Repo::load_rev(&git, &Git::remote_ref(MAIN))?,
-            config: Config::load(dir)?,
-            head: Repo::load(dir)?,
-            branch,
-            git,
-            restart,
+            base: started_from(&git, rev)?,
+            config: Config::load(worktree.dir())?,
+            head: Repo::load(worktree.dir())?,
+            branch: format!("{SIGN_PREFIX}{name}"),
+            worktree,
         })
     }
 
@@ -147,26 +127,27 @@ impl Event {
 
     /// Commits `paths` and pushes the event, then shows its status.
     pub fn finish(self, message: &str, paths: &[&str]) -> Result<()> {
-        self.head.save(self.git.dir())?;
-        let committed = self.git.commit(message, paths)?;
-        if committed || self.restart {
-            self.git.push(&self.branch, self.restart)?;
+        self.head.save(self.worktree.dir())?;
+        if !self.worktree.commit(message, paths)? {
+            println!("Nothing new to push.");
+            return Ok(());
         }
+        self.worktree.push(&self.branch)?;
         let status = self.status()?;
         println!();
         ui::write_event(&mut stdout(), &self.branch, &status);
         println!();
-        if self.restart {
-            println!("Pushed {}, replacing the earlier event.", self.branch);
-        } else if committed {
-            println!("Pushed {}.", self.branch);
-        } else {
-            println!("Nothing new to push.");
-        }
-        let changed_files = self.git.changed_files(&Git::remote_ref(MAIN))?;
+        println!("Pushed {}.", self.branch);
+        let changed_files = self.worktree.changed_files(&Git::remote_ref(MAIN))?;
         println!("{}", status.next_step(&changed_files));
         Ok(())
     }
+}
+
+/// The metadata of the main commit that the event at `rev` started from. Comparing an event with
+/// that, rather than with main, keeps what was merged into main since out of its changes.
+pub fn started_from(git: &Git, rev: &str) -> Result<Repo> {
+    Repo::load_rev(git, &git.merge_base(&Git::remote_ref(MAIN), rev)?)
 }
 
 /// `path` as part of a branch name.

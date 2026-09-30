@@ -150,7 +150,7 @@ impl GitHub {
         }
         let mut body = String::from(
             "CI can't sign these roles. Someone with their keys must renew them before they \
-             expire, with `tufops apply --event renew`.\n\n",
+             expire, with `tufops apply`.\n\n",
         );
         for role in roles {
             let (_, expires) = repo.require_header(role)?;
@@ -228,8 +228,8 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         git.run(&["checkout", "--quiet", "-B", &branch, &tip])?;
         git.run(&["merge", "--no-edit", &main]).with_context(|| {
             format!(
-                "{branch} conflicts with {MAIN}: start it over with --restart, for example \
-                 `tufops apply --event {event} --restart`"
+                "{branch} conflicts with {MAIN}: make its change again with tufops, which starts \
+                 a new event, and delete {branch}"
             )
         })?;
         let changed_files = git.changed_files(&main)?;
@@ -263,7 +263,7 @@ async fn signing_event(github: &GitHub, dir: &Path, event: &str) -> Result<()> {
         if !merge {
             return Ok(());
         }
-        match git.push(MAIN, false) {
+        match git.push(MAIN) {
             Ok(_) => return git.run(&["push", REMOTE, "--delete", &branch]).map(drop),
             Err(err) if attempt < 3 => eprintln!("retrying: {err:#}"),
             Err(err) => return Err(err),
@@ -285,7 +285,7 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
     let changed = tufops_cloud::update_online(&git, &config, previous.as_ref()).await?;
     debug!(?changed, "updated the online roles");
     if !changed.is_empty()
-        && let Err(err) = git.push(MAIN, false)
+        && let Err(err) = git.push(MAIN)
     {
         // If main moved on, the run for the newer commit does this work instead.
         git.fetch()?;
@@ -309,11 +309,12 @@ async fn main_branch(github: &GitHub, dir: &Path) -> Result<()> {
         expiring.into_iter().partition(|r| config.online_only(r));
     debug!(?online, ?offline, "roles in their signing period");
     if !offline.is_empty() && !git.remote_events()?.iter().any(|e| e == REFRESH_EVENT) {
-        let branch = git.checkout_event(REFRESH_EVENT, false)?;
-        repo.with_roles_from(&head, &offline).save(dir)?;
+        let branch = format!("{SIGN_PREFIX}{REFRESH_EVENT}");
+        let worktree = git.worktree(&Git::remote_ref(MAIN))?;
+        repo.with_roles_from(&head, &offline).save(worktree.dir())?;
         let message = format!("Start new versions of {}", offline.join(", "));
-        git.commit(&message, &[METADATA])?;
-        git.push(&branch, false)?;
+        worktree.commit(&message, &[METADATA])?;
+        worktree.push(&branch)?;
         println!("Started {branch} for {offline:?}; its workflow run opens the pull request");
     }
     github.report_renewals(&repo, &online).await
