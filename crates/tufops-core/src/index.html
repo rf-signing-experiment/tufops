@@ -59,7 +59,7 @@
       <table>
         <thead><tr>
           <th>Role</th><th>Version</th><th>Expires</th><th>Signatures</th><th>Keys</th>
-          <th>Delegated paths</th><th class="num">Targets</th>
+          <th>Delegated paths</th><th class="num">Targets</th><th class="num">Size</th>
         </tr></thead>
         <tbody></tbody>
       </table>
@@ -76,12 +76,21 @@
 <script>
 "use strict";
 
+// The size in bytes of each metadata file read, by file name.
+const sizes = new Map();
+
 // Reads `metadata/<name>`, returning its signed part.
 async function get(name) {
   const response = await fetch(`metadata/${name}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
-  return (await response.json()).signed;
+  const bytes = await response.arrayBuffer();
+  sizes.set(name, bytes.byteLength);
+  return JSON.parse(new TextDecoder().decode(bytes)).signed;
 }
+
+// Timestamp is the one role published without its version in the file name.
+const metadataFile = (name, meta) =>
+  name === "timestamp" ? "timestamp.json" : `${meta.version}.${name}.json`;
 
 // Nothing refers to the newest root, so find it: double the version until one is missing, then
 // narrow down between the last that exists and the first that doesn't.
@@ -125,8 +134,7 @@ function rolesTable(rows) {
     const expired = new Date(meta.expires) < new Date();
     const keys = el("td");
     for (const id of definition.keyids) keys.append(el("code", id.slice(0, 8), { title: id }), " ");
-    // Timestamp is the one role published without its version in the file name.
-    const file = name === "timestamp" ? "timestamp.json" : `${meta.version}.${name}.json`;
+    const file = metadataFile(name, meta);
     const role = el("td");
     role.append(el("a", name, { href: `metadata/${encodeURIComponent(file)}` }));
     const tr = el("tr");
@@ -138,6 +146,7 @@ function rolesTable(rows) {
       keys,
       el("td", (definition.paths ?? []).join(", ") || "–"),
       el("td", count ?? "–", { className: "num" }),
+      el("td", size(sizes.get(file)), { className: "num" }),
     );
     body.append(tr);
   }
@@ -151,10 +160,11 @@ function targetsSections(roles) {
   for (const [name, meta] of roles) {
     const paths = Object.keys(meta.targets ?? {}).sort();
     if (paths.length === 0) continue;
-    const details = el("details", undefined, { open: paths.length <= 100 });
+    const details = el("details", undefined, { open: paths.length <= 20 });
     const summary = el("summary");
     const count = el("span", "", { className: "muted" });
-    summary.append(el("strong", name), " ", count);
+    const bytes = el("span", ` · ${size(sizes.get(metadataFile(name, meta)))}`, { className: "muted" });
+    summary.append(el("strong", name), " ", count, bytes);
     const body = el("tbody");
     const rows = paths.map((path) => {
       const target = meta.targets[path];
@@ -164,7 +174,7 @@ function targetsSections(roles) {
       const tr = el("tr");
       tr.append(el("td"), el("td", size(target.length), { className: "num" }), el("td"));
       tr.cells[0].append(link);
-      tr.cells[2].append(el("code", sha256.slice(0, 16) + "…", { title: sha256 }));
+      tr.cells[2].append(el("code", sha256.slice(0, 12) + "…", { title: sha256 }));
       body.append(tr);
       return { path: path.toLowerCase(), tr };
     });
