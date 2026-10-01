@@ -375,38 +375,29 @@ clients as their trusted root.
 ## 4. Adding and changing files
 
 ```sh
-tufops add --from ./build/fw-1.2.bin --to firmware/fw-1.2.bin
-tufops add --from ./build/out/ --to nightly/2026-09-23/        # a whole directory
-tufops add --from ./build/out/ --to nightly/latest/ --delete   # make nightly/latest/ match it
+tufops add ./build/fw-1.2.bin firmware/fw-1.2.bin
+tufops add ./build/out/ nightly/2026-09-23/        # a whole directory
+tufops add ./build/out/ nightly/latest/ --delete   # make nightly/latest/ match it
 ```
 
 `add`:
 
 1. Starts a new signing event, `sign/add-<to>-<time>`, from `main` in a temporary worktree.
 2. Hashes each file and compares it with the metadata. Files the repository already lists at
-   the same path with the same SHA-256 are skipped. The rest are uploaded to
-   `targets/<dir>/<sha256>.<name>` in the bucket. Clients can't see them until metadata that
-   lists them is published.
+   the same path with the same SHA-256 are skipped. The rest are uploaded to the bucket.
 3. Adds each new or changed file to the role whose `paths` match it, or to `targets` if none
    match.
 4. Signs with the online keys those roles need. If your YubiKey is plugged in and needed, it
    shows what you would sign and asks before signing (see §5).
 5. Commits and pushes the event, then prints its status.
 
-**Making a directory match.** With `--delete`, `add` also removes the targets in the `--to`
-directory that `--from` lacks, so the directory ends up with exactly the files of `--from`.
-`--to` is a directory when it ends in `/` or `--from` is one, and `--to /` makes the whole
-repository match. As with `tufops rm`, the removed files stay in the bucket. Because unchanged
-files are skipped, rerunning `add --delete`, say from a nightly job, only uploads what changed.
+**Mirroring a directory** With `--delete`, any files in the target directory that do not
+exist in the source directory are deleted.
 
 **Previewing.** `--dry-run` lists what `add` would add, change and remove.
 
 For a role signed only by online keys, CI merges and publishes straight away. For an offline
 role, CI opens a pull request. The signers sign it, then a maintainer merges it.
-
-**Changing a file** is the same command with the same `--to`. The new content replaces the old
-entry. The old artifact stays in the bucket, so clients that still have older metadata keep
-working.
 
 **Removing files** takes their target paths; a path ending in `/` removes everything under it:
 
@@ -417,15 +408,8 @@ tufops rm nightly/2026-09-01/ nightly/2026-09-02/
 
 `rm` removes each matching target from whichever role lists it, in a new signing event,
 `sign/rm-<first path>-<time>`. It signs and pushes like `add`, and the status lists each removed
-target. The uploaded files stay in the bucket, so
-clients holding older metadata can still download them.
-
-If an upload or signature fails, tufops shows the error and asks whether to **try again** or
-**give up**. You can fix the problem (log in to `gcloud`, re-plug the YubiKey) and continue
-without starting over. Nothing is pushed until the end.
-
-Every change gets its own event. If an event conflicts with something merged into `main` since
-it started, CI says so: make the change again, which starts a new event, and delete the old one.
+target. The uploaded files stay in the bucket, so clients holding older metadata can still
+download them.
 
 ## 5. Signing with a YubiKey
 
@@ -584,7 +568,7 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 |---|---|
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
-| `tufops add --from PATH --to PATH [--delete] [--dry-run]` | Upload new and changed artifacts and add them in a new signing event; `--delete` also removes targets `--from` lacks, `--dry-run` only lists the changes. |
+| `tufops add <FROM> <TO> [--delete] [--dry-run]` | Upload new and changed artifacts and add them in a new signing event; `--delete` remove extra files in <TO> |
 | `tufops rm PATH…` | Remove targets (a path ending in `/` removes everything under it) in a new signing event; their uploads are kept. |
 | `tufops apply` | Update metadata to match your `tufops.toml` edits in a new signing event. |
 | `tufops online` | Sign new versions that are due of the roles CI signs, and push them to `main`. |

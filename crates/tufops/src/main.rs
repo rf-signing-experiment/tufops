@@ -51,13 +51,10 @@ enum Command {
     /// Upload new and changed artifacts and add them to the repository in a new signing event.
     Add {
         /// Local file or directory to add.
-        #[arg(long)]
         from: PathBuf,
-        /// Target path in the repository; a directory when it ends in `/` or `--from` is one.
-        #[arg(long)]
+        /// Target path in the repository; a directory when it ends in `/`.O
         to: String,
-        /// Also remove the targets in the `--to` directory that `--from` lacks, so it matches
-        /// `--from` exactly; their uploads are kept.
+        /// Remove the artifacts in the target directory that are missing from the source.
         #[arg(long)]
         delete: bool,
         /// List what would be added, changed and removed, without uploading, signing or pushing

@@ -70,8 +70,6 @@ fn describe(file: &Path) -> Result<TargetDescription> {
     Ok(desc)
 }
 
-/// The directory `--to` names, as the start of the target paths in it ("" for the whole
-/// repository), or `None` when it names a single file.
 fn target_dir(from: &Path, to: &str) -> Option<String> {
     if from.is_file() && !to.ends_with('/') {
         return None;
