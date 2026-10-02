@@ -6,7 +6,10 @@ use std::fmt;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tuf::crypto::{KeyId, PublicKey};
-use tuf::metadata::{Delegation, RootMetadata, TargetDescription, TargetPath, TargetsMetadata};
+use tuf::metadata::{
+    Delegation, MetadataThreshold, MetadataVersion, RootMetadata, TargetDescription, TargetPath,
+    TargetsMetadata,
+};
 
 use crate::config::{Config, TOP_LEVEL_ROLES};
 use crate::publish::{target_object, target_sha256};
@@ -26,14 +29,14 @@ pub struct Key {
 pub struct Requirement {
     /// Whether these are the previous root's keys, which must also sign a new root version.
     pub previous_root: bool,
-    pub threshold: u32,
+    pub threshold: MetadataThreshold,
     pub signed: Vec<Key>,
     pub unsigned: Vec<Key>,
 }
 
 impl Requirement {
     pub fn met(&self) -> bool {
-        self.signed.len() as u32 >= self.threshold
+        self.signed.len() as u32 >= self.threshold.get()
     }
 
     /// Keys whose signatures are still needed: the unsigned ones, until the threshold is met.
@@ -83,8 +86,8 @@ impl fmt::Display for Change {
 pub struct RoleStatus {
     pub role: String,
     /// The version and expiry on main, if the role exists there.
-    pub base: Option<(u32, DateTime<Utc>)>,
-    pub version: u32,
+    pub base: Option<(MetadataVersion, DateTime<Utc>)>,
+    pub version: MetadataVersion,
     pub expires: DateTime<Utc>,
     /// What the metadata changes compared with main.
     pub changes: Vec<Change>,
@@ -334,8 +337,8 @@ fn key_changes(
     out: &mut Vec<Change>,
     config: &Config,
     what: &str,
-    old: Option<(u32, &HashSet<KeyId>)>,
-    (threshold, ids): (u32, &HashSet<KeyId>),
+    old: Option<(MetadataThreshold, &HashSet<KeyId>)>,
+    (threshold, ids): (MetadataThreshold, &HashSet<KeyId>),
 ) {
     let describe = |ids: &HashSet<KeyId>| -> BTreeSet<_> {
         let name = |id| format!("{} [{}]", config.describe_key(id), short(id));

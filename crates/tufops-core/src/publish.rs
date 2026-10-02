@@ -105,8 +105,8 @@ async fn check_timestamp(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
     let published_version = parsed.context("parsing the published timestamp")?.version();
     let (version, _) = repo.require_header("timestamp")?;
     debug!(
-        published_version,
-        version, "checking the published timestamp"
+        %published_version,
+        %version, "checking the published timestamp"
     );
     ensure!(
         published_version <= version,

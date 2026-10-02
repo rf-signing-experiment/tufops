@@ -1,6 +1,7 @@
 //! The TUF metadata of a repository: loading, editing and signing it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,9 +9,9 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use tracing::{debug, warn};
 use tuf::crypto::{KeyId, PublicKey, Signature, SignatureValue};
 use tuf::metadata::{
-    Delegation, Delegations, Metadata, MetadataDescription, MetadataPath, RawSignedMetadata,
-    RoleDefinition, RootMetadata, SignedMetadataBuilder, SnapshotMetadata, TargetDescription,
-    TargetPath, TargetsMetadata, TimestampMetadata,
+    Delegation, Delegations, Metadata, MetadataDescription, MetadataPath, MetadataThreshold,
+    MetadataVersion, RawSignedMetadata, RoleDefinition, RootMetadata, SignedMetadataBuilder,
+    SnapshotMetadata, TargetDescription, TargetPath, TargetsMetadata, TimestampMetadata,
 };
 use tuf::pouf::{Pouf, Pouf1};
 
@@ -23,7 +24,7 @@ pub const METADATA: &str = "metadata";
 /// Every root version, which clients need to walk from the root they trust to the newest.
 pub const ROOT_HISTORY: &str = "root_history";
 
-type Build<M> = Box<dyn Fn(u32, DateTime<Utc>) -> tuf::Result<M>>;
+type Build<M> = Box<dyn Fn(MetadataVersion, DateTime<Utc>) -> tuf::Result<M>>;
 
 /// The metadata files of one state of the repository, keyed by path relative to `metadata/`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -105,7 +106,7 @@ impl Repo {
     /// Every root version, oldest first.
     pub fn root_history(&self) -> Result<Vec<&[u8]>> {
         let version = self.root()?.version();
-        (1..=version)
+        (1..=version.get())
             .map(|v| {
                 let name = history_file(v);
                 self.files
@@ -123,7 +124,8 @@ impl Repo {
         pretty.push(b'\n');
         if role == "root" {
             let version = parse_unverified::<RootMetadata>(&pretty)?.version();
-            self.files.insert(history_file(version), pretty.clone());
+            self.files
+                .insert(history_file(version.get()), pretty.clone());
         }
         self.files.insert(file(role), pretty);
         Ok(())
@@ -177,8 +179,9 @@ impl Repo {
     }
 
     /// Version and expiry of `role`.
-    pub fn header(&self, role: &str) -> Result<Option<(u32, DateTime<Utc>)>> {
-        fn get<M: Metadata>(repo: &Repo, role: &str) -> Result<Option<(u32, DateTime<Utc>)>> {
+    pub fn header(&self, role: &str) -> Result<Option<(MetadataVersion, DateTime<Utc>)>> {
+        type Header = Option<(MetadataVersion, DateTime<Utc>)>;
+        fn get<M: Metadata>(repo: &Repo, role: &str) -> Result<Header> {
             Ok(repo
                 .metadata::<M>(role)?
                 .map(|m| (m.version(), *m.expires())))
@@ -191,13 +194,13 @@ impl Repo {
         }
     }
 
-    pub fn require_header(&self, role: &str) -> Result<(u32, DateTime<Utc>)> {
+    pub fn require_header(&self, role: &str) -> Result<(MetadataVersion, DateTime<Utc>)> {
         self.header(role)?
             .with_context(|| format!("{role} metadata is missing"))
     }
 
     /// Threshold and keys `role` must be signed with, according to this repository's metadata.
-    pub fn role_keys(&self, role: &str) -> Result<(u32, Vec<PublicKey>)> {
+    pub fn role_keys(&self, role: &str) -> Result<(MetadataThreshold, Vec<PublicKey>)> {
         let pick = |ids: &HashSet<KeyId>, keys: &HashMap<KeyId, PublicKey>| {
             let mut picked: Vec<_> = ids.iter().filter_map(|id| keys.get(id).cloned()).collect();
             picked.sort();
@@ -223,7 +226,11 @@ impl Repo {
 
     /// The key sets whose thresholds `role` must meet: its own, and for a new root version also
     /// the previous root's.
-    pub fn requirements(&self, base: &Repo, role: &str) -> Result<Vec<(u32, Vec<PublicKey>)>> {
+    pub fn requirements(
+        &self,
+        base: &Repo,
+        role: &str,
+    ) -> Result<Vec<(MetadataThreshold, Vec<PublicKey>)>> {
         let mut reqs = vec![self.role_keys(role)?];
         if role == "root"
             && base
@@ -257,7 +264,7 @@ impl Repo {
         let mut missing = vec![];
         for (threshold, keys) in self.requirements(base, role)? {
             let signed = self.signed_by(role, &keys)?;
-            if (signed.len() as u32) < threshold {
+            if (signed.len() as u32) < threshold.get() {
                 missing.extend(keys.into_iter().filter(|k| !signed.contains(k)));
             }
         }
@@ -310,7 +317,7 @@ impl Repo {
             let in_signing_period = config.in_signing_period(cur.expires(), now);
             debug!(
                 role,
-                version = cur.version(),
+                version = %cur.version(),
                 expires = %cur.expires(),
                 unchanged,
                 expiry_changed,
@@ -322,9 +329,12 @@ impl Repo {
                 return Ok(None);
             }
         }
-        let version = base.header(role)?.map_or(1, |(v, _)| v + 1);
+        let version = match base.header(role)? {
+            Some((v, _)) => v.checked_add(1).context("version overflow")?,
+            None => MetadataVersion::ONE,
+        };
         let expires = now + Duration::days(config.expires_days);
-        debug!(role, version, %expires, "starting a new version of {role}");
+        debug!(role, %version, %expires, "starting a new version of {role}");
         let metadata = build(version, expires)?;
         let signed = SignedMetadataBuilder::<Pouf1, M>::from_metadata(&metadata)?.build();
         self.put(role, signed.to_raw()?.as_bytes())?;
@@ -512,7 +522,10 @@ pub fn parse_unverified<M: Metadata>(bytes: &[u8]) -> tuf::Result<M> {
 }
 
 /// Threshold and key ids that `root` gives the top-level `role`.
-pub fn root_role_keys<'a>(root: &'a RootMetadata, role: &str) -> (u32, &'a HashSet<KeyId>) {
+pub fn root_role_keys<'a>(
+    root: &'a RootMetadata,
+    role: &str,
+) -> (MetadataThreshold, &'a HashSet<KeyId>) {
     match role {
         "root" => (root.root().threshold(), root.root().key_ids()),
         "targets" => (root.targets().threshold(), root.targets().key_ids()),
@@ -539,14 +552,15 @@ fn config_role_keys(
     config: &Config,
     role: &RoleConfig,
     keys: &mut HashMap<KeyId, PublicKey>,
-) -> Result<(u32, HashSet<KeyId>)> {
+) -> Result<(MetadataThreshold, HashSet<KeyId>)> {
     let mut ids = HashSet::new();
     for name in &role.keys {
         let key = config.public_key(name)?;
         ids.insert(key.key_id().clone());
         keys.insert(key.key_id().clone(), key);
     }
-    Ok((role.threshold, ids))
+    let threshold = NonZeroU32::new(role.threshold).context("threshold must not be 0")?;
+    Ok((threshold.into(), ids))
 }
 
 fn root_builder(config: &Config) -> Result<Build<RootMetadata>> {

@@ -364,8 +364,8 @@ async fn client_finds(repo: &Repo, store: &MemStore, paths: &[&str]) -> Vec<bool
             continue;
         };
         let (version, role) = match file.split_once('.') {
-            Some((v, role)) => (MetadataVersion::Number(v.parse().unwrap()), role),
-            None => (MetadataVersion::None, file),
+            Some((v, role)) => (Some(MetadataVersion::new(v.parse().unwrap())), role),
+            None => (None, file),
         };
         let path = MetadataPath::new(role.to_owned()).unwrap();
         remote
@@ -510,17 +510,86 @@ async fn delegated_paths() {
         listed,
         ["a/x", "b/two/q", "b/y"].map(|p| TargetPath::new(p).unwrap())
     );
+}
 
-    // Paths that more than one role covers are rejected; a mere common prefix is fine.
-    for overlapping in ["b/", "b/sub/", "b/file"] {
-        let err = delegating_config(&key, &[("alpha", overlapping), ("beta", "b/")]);
-        let err = err.err().unwrap();
-        assert!(
-            format!("{err:#}").contains("overlap"),
-            "{overlapping}: {err:#}"
-        );
+/// Roles with paths under other roles' paths: each target goes in the role with the most
+/// specific path covering it, and clients find it there.
+#[tokio::test]
+async fn nested_delegations() {
+    let key = TestKey::new();
+    let now = Utc::now();
+    let store = MemStore::default();
+    let target = |path: &str| {
+        let desc = TargetDescription::from_slice(path.as_bytes(), &[HashAlgorithm::Sha256]);
+        (TargetPath::new(path).unwrap(), desc.unwrap())
+    };
+    let role_of = |repo: &Repo, path: &str| {
+        repo.role_for_target(&TargetPath::new(path).unwrap())
+            .unwrap()
+    };
+
+    // By name, archive would come first and hide the roles under it from clients.
+    let nested = [
+        ("archive", "archive/"),
+        ("recent", "archive/2026/"),
+        ("today", "archive/2026/10/"),
+        ("zfile", "archive/2026/notes"),
+    ];
+    let config = delegating_config(&key, &nested).unwrap();
+    let order: Vec<_> = config.delegations().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(order, ["today", "zfile", "recent", "archive"]);
+
+    let mut repo = Repo::default();
+    repo.apply_config(&config, None, &Repo::default(), now)
+        .unwrap();
+    let paths = [
+        "archive/x",
+        "archive/2026/x",
+        "archive/2026/10/x",
+        "archive/2026/notes",
+        "archive/2025/x",
+    ];
+    let files: Vec<_> = paths.map(target).into();
+    for (path, desc) in &files {
+        store
+            .put(&target_object(path, desc).unwrap(), vec![])
+            .await
+            .unwrap();
     }
+    repo.add_targets(&config, &repo.clone(), files, now)
+        .unwrap();
+    let roles = paths.map(|p| role_of(&repo, p));
+    assert_eq!(roles, ["archive", "recent", "today", "zfile", "archive"]);
+    repo.update_online(&config, None, now).unwrap();
+    let roles: Vec<_> = repo.roles().map(str::to_owned).collect();
+    sign_all(&mut repo, &Repo::default(), &roles, &[&key]).await;
+    assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
+
+    // Dropping the nested roles moves their targets back up to archive.
+    let config = delegating_config(&key, &nested[..1]).unwrap();
+    let main = repo.clone();
+    repo.apply_config(&config, None, &main, now).unwrap();
+    assert_eq!(paths.map(|p| role_of(&repo, p)), ["archive"; 5]);
+    let mut listed: Vec<_> = repo.listed_targets().unwrap().into_keys().collect();
+    listed.sort();
+    let mut expected = paths.map(|p| TargetPath::new(p).unwrap());
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    // Two roles with the same path are rejected; a mere common prefix is fine.
+    let err = delegating_config(&key, &[("alpha", "b/"), ("beta", "b/")]).unwrap_err();
+    assert!(format!("{err:#}").contains("overlap"), "{err:#}");
     delegating_config(&key, &[("alpha", "bb/"), ("beta", "b/")]).unwrap();
+
+    // So are roles that can't be ordered so each path is searched before the paths covering it.
+    let mut text = format!("storage = \"gs://bucket\"\n{}", key_toml("online", &key));
+    for role in TOP_LEVEL_ROLES {
+        text += &role_toml(role, "online", "");
+    }
+    text += &role_toml("alpha", "online", "paths = [\"a/\", \"b/x/\"]");
+    text += &role_toml("beta", "online", "paths = [\"b/\", \"a/x/\"]");
+    let err = Config::parse(&text).unwrap_err();
+    assert!(format!("{err:#}").contains("overlap"), "{err:#}");
 }
 
 /// A role signed by an online key that doesn't sign snapshot or timestamp: CI doesn't hold such

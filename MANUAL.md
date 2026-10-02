@@ -554,10 +554,17 @@ tufops publish    # verify and upload
 | `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. Changing it needs no signatures. |
 | `paths` | Delegated roles only: target paths delegated from `targets`. A path ending in `/` covers everything under it; any other path covers just that file. Paths must not start with `/`. |
 
-Delegations are terminating, and clients try them in alphabetical order of role name, stopping
-at the first whose paths cover the target. Since that order can't be chosen, each path may
-belong to only one role: `tufops.toml` is rejected if one role's path equals or falls under
-another's (for example `fw/` and `fw/beta/`). `fw/` and `fwx/` don't overlap.
+Delegations are terminating: clients try them in the order `targets` lists them, stopping at
+the first whose paths cover the target. Roles may have paths under other roles' paths, for
+example `archive/` and `archive/2026/`. tufops lists roles with the deepest paths first, then in
+alphabetical order of role name, so each target belongs to the role with the most specific path
+covering it: `archive/2026/a` to the `archive/2026/` role, `archive/2025/a` to the `archive/`
+role. A role with several paths is placed by its shallowest one. Adding or removing a nested
+role moves the targets under it, like any other change to `paths`.
+
+`tufops.toml` is rejected if a role's path equals or covers a path of a role listed after it,
+since clients would never look in the later role: two roles with the same path, or a role with
+`a/` and `b/x/` alongside one with `b/` and `a/x/`. `fw/` and `fwx/` don't overlap.
 
 Clients must match paths the same way: rust-tuf does. Clients that treat paths as shell-style
 patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everything under it.

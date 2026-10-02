@@ -1,6 +1,7 @@
 //! `tufops.toml`: the declarative description of keys and roles.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -11,7 +12,6 @@ use tuf::metadata::{MetadataPath, TargetPath};
 
 use crate::backend::public_key_from_pem;
 use crate::git::Git;
-use crate::repo::covers;
 
 pub const FILE: &str = "tufops.toml";
 
@@ -24,9 +24,11 @@ pub struct Config {
     /// Where the repository is published, for example `gs://bucket/prefix`.
     pub storage: String,
     pub keys: BTreeMap<String, KeyConfig>,
-    /// Top-level roles, plus roles delegated from `targets` (those with `paths`). Delegations are
-    /// kept sorted by name, which is also the order clients search them in.
+    /// Top-level roles, plus roles delegated from `targets` (those with `paths`).
     pub roles: BTreeMap<String, RoleConfig>,
+    /// Delegated roles in the order clients search them in. See `search_order`.
+    #[serde(skip)]
+    delegation_order: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,13 +79,13 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Config = toml::from_str(text)?;
+        let mut config: Config = toml::from_str(text)?;
         config.validate()?;
+        config.delegation_order = config.search_order()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
-        let mut paths = vec![];
         for (name, key) in &self.keys {
             ensure!(
                 key.owner.is_some() != key.online.is_some(),
@@ -118,21 +120,46 @@ impl Config {
                 "role {name}: `paths` must be set on delegated roles only"
             );
             for path in &role.paths {
-                let path = TargetPath::new(path).with_context(|| format!("role {name}: path"))?;
-                paths.push((name, path));
-            }
-        }
-        // Clients stop at the first delegation covering a target, and delegations are always in
-        // alphabetical order, so each path may belong to one role only.
-        for (i, (a, p)) in paths.iter().enumerate() {
-            for (b, q) in &paths[i + 1..] {
-                ensure!(
-                    a == b || !(covers(p, q) || covers(q, p)),
-                    "roles {a} ({p}) and {b} ({q}) overlap: each path may belong to one role only"
-                );
+                TargetPath::new(path).with_context(|| format!("role {name}: path"))?;
             }
         }
         Ok(())
+    }
+
+    /// Orders the delegated roles the way clients search them: deepest paths first, so that
+    /// `fw/beta/` comes before `fw/`, then by name. A role's depth is that of its shallowest path.
+    /// Rejected if a role still comes before one with a path its own paths cover, since clients
+    /// would never look for that path's targets in the later role.
+    fn search_order(&self) -> Result<Vec<String>> {
+        let depth = |path: &String| path.split('/').filter(|part| !part.is_empty()).count();
+        let mut roles: Vec<_> = (self.roles.iter())
+            .filter(|(_, role)| !role.paths.is_empty())
+            .collect();
+        roles.sort_by_key(|(_, role)| Reverse(role.paths.iter().map(depth).min()));
+        // The first role listing each path, and its position.
+        let mut first = HashMap::new();
+        for (position, (name, role)) in roles.iter().enumerate() {
+            for path in &role.paths {
+                first.entry(path.as_str()).or_insert((position, name));
+            }
+        }
+        for (position, (name, role)) in roles.iter().enumerate() {
+            for path in &role.paths {
+                // The paths covering `path`, the way clients match them: `path`, and each
+                // directory above it.
+                let dirs = path.match_indices('/').map(|(end, _)| &path[..=end]);
+                for covering in dirs.chain([path.as_str()]) {
+                    if let Some((first_position, first_name)) = first.get(covering) {
+                        ensure!(
+                            *first_position >= position,
+                            "roles {first_name} ({covering}) and {name} ({path}) overlap: \
+                             clients would look for {path} in {first_name} only"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(roles.into_iter().map(|(name, _)| name.clone()).collect())
     }
 
     pub fn role(&self, name: &str) -> Result<&RoleConfig> {
@@ -141,9 +168,9 @@ impl Config {
             .with_context(|| format!("role {name} is not in {FILE}"))
     }
 
-    /// Roles delegated from `targets`.
+    /// Roles delegated from `targets`, in the order clients search them in.
     pub fn delegations(&self) -> impl Iterator<Item = (&String, &RoleConfig)> {
-        self.roles.iter().filter(|(_, r)| !r.paths.is_empty())
+        (self.delegation_order.iter()).map(|name| (name, &self.roles[name]))
     }
 
     /// Whether every key of `role` is online.
