@@ -114,6 +114,15 @@ function el(tag, text, props = {}) {
 
 const date = (iso) => iso.replace("T", " ").replace("Z", " UTC");
 
+// How long until `iso`, or how long ago it was: in hours within three days, else in days.
+function fromNow(iso) {
+  const hours = (new Date(iso) - new Date()) / 3600000;
+  const [amount, unit] = Math.abs(hours) <= 72 ? [hours, "hour"] : [hours / 24, "day"];
+  const count = Math.trunc(Math.abs(amount));
+  const text = count === 0 ? "under an hour" : `${count} ${unit}${count === 1 ? "" : "s"}`;
+  return hours < 0 ? `${text} ago` : `in ${text}`;
+}
+
 function size(bytes) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
@@ -141,7 +150,10 @@ function rolesTable(rows) {
     tr.append(
       role,
       el("td", meta.version),
-      el("td", date(meta.expires) + (expired ? " (expired)" : ""), expired ? { className: "bad" } : {}),
+      el("td", fromNow(meta.expires) + (expired ? " (expired)" : ""), {
+        title: date(meta.expires),
+        className: expired ? "bad" : "",
+      }),
       el("td", `${definition.threshold} of ${definition.keyids.length}`),
       keys,
       el("td", (definition.paths ?? []).join(", ") || "–"),
@@ -223,7 +235,8 @@ async function main() {
 
   const origin = location.href.replace(/[^/]*$/, "");
   document.getElementById("status").textContent =
-    `${origin} · timestamp version ${timestamp.version}, expires ${date(timestamp.expires)}`;
+    `${origin} · timestamp version ${timestamp.version}, expires ${fromNow(timestamp.expires)}`;
+  document.getElementById("status").title = `timestamp expires ${date(timestamp.expires)}`;
 
   rolesTable([
     { name: "root", meta: root, definition: root.roles.root },
