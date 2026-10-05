@@ -288,15 +288,18 @@ threshold = 1
 expires_days = 2
 signing_days = 1
 
-# Delegated roles: any role with `paths`, patterns of the target paths it signs.
-[roles.firmware]
+# Delegated roles, which clients search in this order. `paths` are patterns of the target paths
+# each one signs.
+[[delegations]]
+name = "firmware"
 paths = ["firmware/*"]
 keys = ["alice", "bob"]
 threshold = 2
 expires_days = 365
 signing_days = 60
 
-[roles.nightly]
+[[delegations]]
+name = "nightly"
 paths = ["nightly/*/*"]                # nightly/<date>/<file>, nightly/latest/<file>
 keys = ["online"]
 threshold = 1
@@ -469,17 +472,18 @@ metadata and `tufops.toml`) and pushes like `add`. Typical changes:
 
 * **Add or replace a signer**: add their key under `[keys]` and list it in the roles.
 * **Change a threshold**: edit `threshold`.
-* **New delegated role**: add a `[roles.<name>]` with `paths`. Existing targets those paths
-  match, including ones in the top-level `targets`, move into the new role.
-* **Change a role's paths, or split, rename or remove a role**: edit `paths`, or replace or
-  delete the role's section. Targets are never dropped: each moves to the role whose paths now
-  match it, or to the top-level `targets` if none do, so clients keep finding it. For
-  example, replacing `channels` (`channels/*/*`) with `channels-stable` (`channels/stable/*`)
-  and `channels-nightly` (`channels/nightly/*`) moves its targets into those two, and the rest
-  of them into `targets`. The status summarizes moves per pair of roles, as in
-  "3612 targets moved here unchanged from channels". Only targets whose content changes are
-  listed individually. The keys of every role gaining or losing targets must sign. To remove
-  targets, use `tufops rm` (§4).
+* **New delegated role**: add a `[[delegations]]` entry. Existing targets its paths match,
+  including ones in the top-level `targets`, move into the new role, unless a role listed
+  before it matches them too.
+* **Change a role's paths, or split, rename, reorder or remove roles**: edit `paths`, or
+  replace, move or delete the role's entry. Targets are never dropped: each moves to the first
+  role whose paths now match it, or to the top-level `targets` if none do, so clients keep
+  finding it. For example, replacing `channels` (`channels/*/*`) with `channels-stable`
+  (`channels/stable/*`) and `channels-nightly` (`channels/nightly/*`) moves its targets into
+  those two, and the rest of them into `targets`. The status summarizes moves per pair of
+  roles, as in "3612 targets moved here unchanged from channels". Only targets whose content
+  changes are listed individually. The keys of every role gaining or losing targets must sign.
+  To remove targets, use `tufops rm` (§4).
 * **Rotate the online key**: create a new KMS key version and change `online` and `public_key`.
 * **Change how long a role is valid**: edit its `expires_days`. `apply` compares it with the
   committed `tufops.toml` and gives the role a new version that expires `expires_days` from now.
@@ -549,27 +553,20 @@ tufops publish    # verify and upload
 | `owner` | GitHub user (`@name`) holding the key on a YubiKey (PIV slot 9c). |
 | `online` | Cloud KMS key version: `gcpkms:projects/…/cryptoKeyVersions/N`. |
 | `public_key` | The key's ECDSA P-256 public key as PEM (`tufops pubkey`). |
-| `[roles.<name>]` | A role. `root`, `targets`, `snapshot` and `timestamp` are required. |
+| `[roles.<name>]` | A top-level role: `root`, `targets`, `snapshot` and `timestamp`, all required. |
+| `[[delegations]]` | A role delegated from `targets`, with a `name` and `paths` besides the settings every role has. Clients search them in the order listed. |
 | `keys`, `threshold` | Which keys sign the role, and how many signatures it needs. |
 | `expires_days` | How long each new version is valid. Changing it (with `tufops apply`) starts a new version with the new expiry, which must be signed. |
 | `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. Changing it needs no signatures. |
-| `paths` | Delegated roles only: patterns of the target paths delegated from `targets`. A pattern matches whole target paths, where `*` matches any characters and `?` any one character, but neither matches `/`: `fw/*` matches `fw/a.bin` but not `fw/beta/a.bin`, which takes `fw/*/*`. Patterns must not start or end with `/`, or contain `[`. |
+| `paths` | Delegated roles only: patterns of the target paths delegated to the role. A pattern matches whole target paths, where `*` matches any characters and `?` any one character, but neither matches `/`: `fw/*` matches `fw/a.bin` but not `fw/beta/a.bin`, which takes `fw/*/*`. Patterns must not start or end with `/`, or contain `[`. |
 
-Delegations are terminating: clients try them in the order `targets` lists them, stopping at
-the first whose paths match the target. Patterns of different roles may overlap if one matches
-only some of the paths the other matches, for example `archive/*/*` and `archive/2026/*`.
-tufops lists roles with more specific patterns first, so each target belongs to the role with
-the most specific pattern matching it: `archive/2026/a` to the `archive/2026/*` role,
-`archive/2025/a` to the `archive/*/*` role. A pattern is more specific the more characters other
-than wildcards it has, then the more `?` and the fewer `*`. A role with several patterns is
-placed by its least specific one, and roles that tie are in alphabetical order. Adding or
-removing a nested role moves the targets it matches, like any other change to `paths`.
-
-`tufops.toml` is rejected if patterns of two roles match a path in common and the first role's
-pattern isn't the more specific one, since clients would look for some of the later role's
-targets in the first: the same pattern in two roles, patterns that only partly overlap like
-`fw/*.bin` and `fw/beta-*`, or a role with `a/*/*` and `b/x/*` alongside one with `b/*/*` and
-`a/x/*`. `fw/*` doesn't overlap `fwx/*`, or `fw/*/*`.
+Delegations are terminating: clients try them in the order `[[delegations]]` lists them, and
+stop at the first whose paths match the target. That role is the one the target belongs to.
+Roles' paths may match some of the same targets, so list more specific roles first: with
+`archive-2026` (`archive/2026/*`) listed before `archive` (`archive/*/*`), `archive/2026/a`
+belongs to `archive-2026` and `archive/2025/a` to `archive`. Listed the other way round,
+`archive` gets both. Reordering roles moves their targets like any other change to `paths`, and
+the status shows the new order.
 
 Patterns match as the TUF specification describes, which is how rust-tuf, python-tuf and go-tuf
 match them, except that rust-tuf reads `[` as itself while the others start a character class

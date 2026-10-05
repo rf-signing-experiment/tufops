@@ -1,6 +1,5 @@
 //! `tufops.toml`: the declarative description of keys and roles.
 
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -12,24 +11,45 @@ use tuf::metadata::{MetadataPath, PathPattern};
 
 use crate::backend::public_key_from_pem;
 use crate::git::Git;
-use crate::pattern;
 
 pub const FILE: &str = "tufops.toml";
 
 /// Roles every repository has. Any other role is delegated from `targets`.
 pub const TOP_LEVEL_ROLES: [&str; 4] = ["root", "targets", "snapshot", "timestamp"];
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Config {
     /// Where the repository is published, for example `gs://bucket/prefix`.
     pub storage: String,
     pub keys: BTreeMap<String, KeyConfig>,
     /// Top-level roles, plus roles delegated from `targets` (those with `paths`).
     pub roles: BTreeMap<String, RoleConfig>,
-    /// Delegated roles in the order clients search them in. See `search_order`.
-    #[serde(skip)]
+    /// Delegated roles in the order tufops.toml lists them, which clients search them in.
     delegation_order: Vec<String>,
+}
+
+/// tufops.toml as written: the top-level roles in `roles`, and the delegated roles in
+/// `delegations`, an array to keep their order.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    storage: String,
+    keys: BTreeMap<String, KeyConfig>,
+    roles: BTreeMap<String, RoleConfig>,
+    #[serde(default)]
+    delegations: Vec<DelegationConfig>,
+}
+
+/// A role delegated from `targets`, in tufops.toml's `[[delegations]]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegationConfig {
+    name: String,
+    paths: Vec<String>,
+    keys: Vec<String>,
+    threshold: u32,
+    expires_days: i64,
+    signing_days: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,9 +101,37 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let mut config: Config = toml::from_str(text)?;
+        let file: ConfigFile = toml::from_str(text)?;
+        for name in file.roles.keys() {
+            ensure!(
+                TOP_LEVEL_ROLES.contains(&name.as_str()),
+                "role {name}: only top-level roles go in [roles]; delegated roles go in \
+                 [[delegations]], in the order clients search them"
+            );
+        }
+        let mut config = Config {
+            storage: file.storage,
+            keys: file.keys,
+            roles: file.roles,
+            delegation_order: vec![],
+        };
+        for delegation in file.delegations {
+            let name = delegation.name;
+            ensure!(
+                !config.roles.contains_key(&name),
+                "role {name} is defined twice"
+            );
+            let role = RoleConfig {
+                keys: delegation.keys,
+                threshold: delegation.threshold,
+                expires_days: delegation.expires_days,
+                signing_days: delegation.signing_days,
+                paths: delegation.paths,
+            };
+            config.roles.insert(name.clone(), role);
+            config.delegation_order.push(name);
+        }
         config.validate()?;
-        config.delegation_order = config.search_order()?;
         Ok(config)
     }
 
@@ -119,7 +167,7 @@ impl Config {
             let top = TOP_LEVEL_ROLES.contains(&name.as_str());
             ensure!(
                 top == role.paths.is_empty(),
-                "role {name}: `paths` must be set on delegated roles only"
+                "role {name}: delegated roles need `paths`, and top-level roles take none"
             );
             for path in &role.paths {
                 PathPattern::new(path).with_context(|| format!("role {name}: path {path}"))?;
@@ -138,55 +186,14 @@ impl Config {
         Ok(())
     }
 
-    /// Orders the delegated roles the way clients search them: those with more specific patterns
-    /// first, so that `fw/beta-*` comes before `fw/*`, then by name. A pattern is more specific
-    /// the more characters other than wildcards it has, then the more `?` and the fewer `*` it
-    /// has, and a role is placed by its least specific pattern. Rejected if patterns of two roles
-    /// match some path in common, unless the first role's pattern only matches paths the other's
-    /// matches too: otherwise clients would look for some of the later role's targets in the
-    /// first.
-    fn search_order(&self) -> Result<Vec<String>> {
-        let specificity = |path: &String| {
-            let count = |wildcard: char| path.matches(wildcard).count();
-            let (stars, questions) = (count('*'), count('?'));
-            (
-                path.chars().count() - stars - questions,
-                questions,
-                Reverse(stars),
-            )
-        };
-        let mut roles: Vec<_> = (self.roles.iter())
-            .filter(|(_, role)| !role.paths.is_empty())
-            .collect();
-        roles.sort_by_key(|(_, role)| Reverse(role.paths.iter().map(specificity).min()));
-        // Every path, with the position of its role.
-        let paths: Vec<_> = (roles.iter().enumerate())
-            .flat_map(|(position, (name, role))| {
-                role.paths.iter().map(move |path| (position, name, path))
-            })
-            .collect();
-        for (index, (position, name, path)) in paths.iter().enumerate() {
-            for (later_position, later_name, later_path) in &paths[index + 1..] {
-                if position == later_position || !pattern::overlap(path, later_path) {
-                    continue;
-                }
-                ensure!(
-                    pattern::contains(later_path, path) && !pattern::contains(path, later_path),
-                    "roles {name} ({path}) and {later_name} ({later_path}) overlap, but clients \
-                     search {name} first and {path} is not more specific"
-                );
-            }
-        }
-        Ok(roles.into_iter().map(|(name, _)| name.clone()).collect())
-    }
-
     pub fn role(&self, name: &str) -> Result<&RoleConfig> {
         self.roles
             .get(name)
             .with_context(|| format!("role {name} is not in {FILE}"))
     }
 
-    /// Roles delegated from `targets`, in the order clients search them in.
+    /// Roles delegated from `targets`, in the order tufops.toml lists them, which clients search
+    /// them in.
     pub fn delegations(&self) -> impl Iterator<Item = (&String, &RoleConfig)> {
         (self.delegation_order.iter()).map(|name| (name, &self.roles[name]))
     }

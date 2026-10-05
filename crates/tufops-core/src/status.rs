@@ -280,6 +280,24 @@ fn changes(
         let old = old.map(|o| (o.threshold(), o.key_ids()));
         key_changes(&mut out, config, &what, old, (d.threshold(), d.key_ids()));
     }
+    // Clients search delegations in order, so reordering them can change which role is trusted
+    // for a target.
+    if let Some(old) = &old {
+        let order = |targets: &TargetsMetadata, other: &BTreeMap<String, Delegation>| {
+            let names = targets.delegations().roles().iter();
+            let names = names.map(|delegation| delegation.name().to_string());
+            names
+                .filter(|name| other.contains_key(name))
+                .collect::<Vec<_>>()
+        };
+        let (old_order, new_order) = (order(old, &new_d), order(&new, &old_d));
+        if old_order != new_order {
+            let (old_order, new_order) = (old_order.join(", "), new_order.join(", "));
+            out.push(Change::Other(format!(
+                "delegation order: {old_order} → {new_order}"
+            )));
+        }
+    }
 
     let empty = HashMap::new();
     let old_targets = old.as_ref().map_or(&empty, |o| o.targets());
