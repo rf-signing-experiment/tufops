@@ -9,8 +9,8 @@ use tracing::debug;
 use tuf::Database;
 use tuf::crypto::{HashAlgorithm, HashValue};
 use tuf::metadata::{
-    Metadata, MetadataPath, RawSignedMetadata, TargetDescription, TargetPath, TargetsMetadata,
-    TimestampMetadata,
+    Metadata, MetadataPath, RawSignedMetadata, SnapshotMetadata, TargetDescription, TargetPath,
+    TargetsMetadata, TimestampMetadata,
 };
 use tuf::pouf::Pouf1;
 
@@ -121,12 +121,52 @@ async fn check_timestamp(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
     Ok(())
 }
 
+/// Checks that publishing `repo` would not drop a role the published snapshot lists, or list an
+/// older version of it, which clients that have that snapshot reject as a rollback. That is
+/// allowed once the snapshot keys rotate: clients stop trusting the snapshot they have when they
+/// get a root that no longer accepts its signatures.
+async fn check_snapshot(repo: &Repo, store: &dyn BlobStore) -> Result<()> {
+    let Some(timestamp) = store.get(TIMESTAMP).await? else {
+        return Ok(());
+    };
+    let timestamp = parse_unverified::<TimestampMetadata>(&timestamp);
+    let version = timestamp
+        .context("parsing the published timestamp")?
+        .snapshot()
+        .version();
+    let name = format!("{METADATA_PREFIX}{version}.snapshot.json");
+    let published = store.get(&name).await?;
+    let published = published.with_context(|| format!("storage has no {name}"))?;
+    if !repo.trusts("snapshot", &published)? {
+        debug!("this root no longer trusts the published snapshot, so it may drop roles");
+        return Ok(());
+    }
+    let published = parse_unverified::<SnapshotMetadata>(&published);
+    let published = published.with_context(|| format!("parsing {name}"))?;
+    let snapshot = repo.require::<SnapshotMetadata>("snapshot")?;
+    for (role, listed) in published.meta() {
+        let (version, new) = (listed.version(), snapshot.meta().get(role));
+        ensure!(
+            new.is_some_and(|new| new.version() >= version),
+            "the published snapshot lists {role} at version {version}, and this one {}: clients \
+             that have the published one would reject it. Only rotating the snapshot key lets \
+             the snapshot drop roles.",
+            new.map_or("doesn't list it".to_owned(), |new| format!(
+                "at {}",
+                new.version()
+            ))
+        );
+    }
+    Ok(())
+}
+
 /// Verifies the repository, checks it is not older than what is published and that every target
 /// file has been uploaded, then uploads the metadata objects and the summary page that are
 /// missing or differ, timestamp last. Returns the objects uploaded.
 pub async fn publish(repo: &Repo, store: &dyn BlobStore) -> Result<Vec<String>> {
     verify(repo)?;
     check_timestamp(repo, store).await?;
+    check_snapshot(repo, store).await?;
 
     let uploaded = store.list(TARGETS_PREFIX).await?;
     for role in repo.targets_roles() {

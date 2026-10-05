@@ -224,13 +224,13 @@ async function main() {
   const snapshotVersion = timestamp.meta["snapshot.json"].version;
   const [root, snapshot] = await Promise.all([latestRoot(), get(`${snapshotVersion}.snapshot.json`)]);
 
-  // Every targets role, at the version the snapshot lists.
-  const names = Object.keys(snapshot.meta).map((file) => file.replace(/\.json$/, ""));
-  const loaded = await Promise.all(
-    names.map((name) => get(`${snapshot.meta[name + ".json"].version}.${name}.json`)));
-  const targets = new Map(names.map((name, i) => [name, loaded[i]]));
-  const top = targets.get("targets");
+  // targets and the roles it delegates, at the versions the snapshot lists. The snapshot also
+  // lists roles that were removed, which clients no longer read.
+  const role = (name) => get(`${snapshot.meta[name + ".json"].version}.${name}.json`);
+  const top = await role("targets");
   const delegations = top.delegations?.roles ?? [];
+  const loaded = await Promise.all(delegations.map((d) => role(d.name)));
+  const targets = new Map([["targets", top], ...delegations.map((d, i) => [d.name, loaded[i]])]);
   const count = (name) => Object.keys(targets.get(name)?.targets ?? {}).length;
 
   const origin = location.href.replace(/[^/]*$/, "");

@@ -483,8 +483,10 @@ metadata and `tufops.toml`) and pushes like `add`. Typical changes:
   those two, and the rest of them into `targets`. The status summarizes moves per pair of
   roles, as in "3612 targets moved here unchanged from channels". Only targets whose content
   changes are listed individually. The keys of every role gaining or losing targets must sign.
-  To remove targets, use `tufops rm` (§4).
+  To remove targets, use `tufops rm` (§4). A removed or renamed role stays listed in the
+  snapshot until the snapshot key rotates (see below).
 * **Rotate the online key**: create a new KMS key version and change `online` and `public_key`.
+  If it signs `snapshot`, this also drops removed roles from the snapshot.
 * **Change how long a role is valid**: edit its `expires_days`. `apply` compares it with the
   committed `tufops.toml` and gives the role a new version that expires `expires_days` from now.
   Its `expires` changes, so its keys must sign it. For `snapshot` and `timestamp`, the event only
@@ -499,6 +501,16 @@ version even if their content didn't, so the new keys sign them.
 
 Because the event changes `tufops.toml`, a maintainer merges its pull request after the
 signatures are in.
+
+**Removed roles stay in the snapshot.** TUF clients reject a snapshot that stops listing a role
+the snapshot they have lists, even one `targets` no longer delegates to. So the snapshot keeps
+listing a removed or renamed role at its last version, and a role added later under the same
+name goes on from there. To drop these entries, rotate the key that signs `snapshot`: change its
+`online` and `public_key` to a new KMS key version, or replace it in `[roles.snapshot]` with a
+new key, and run `tufops apply`. Clients stop trusting the snapshot they have once they get a
+root that no longer accepts its signatures, so the first snapshot signed by the new key lists
+only the current roles. Rotating only the timestamp key isn't enough, and neither is adding a
+key while the old one still signs `snapshot`: clients keep a snapshot they can still verify.
 
 ## 7. Expiry and automation
 
@@ -522,6 +534,8 @@ On every push to `main`, the scheduled runs and manual runs, CI:
    snapshot, targets and delegations, including expiry. It also checks that every target has
    been uploaded, and that the bucket's `timestamp.json` is not a newer version (or a different
    one of the same version): clients that already have the newer one would reject the older.
+   Likewise, the snapshot must still list every role the bucket's snapshot lists, at the same
+   version or newer, unless the snapshot key has rotated since.
 3. Uploads only the metadata objects that are missing or differ, comparing MD5 digests with
    the bucket. `timestamp.json` goes last. The summary page `index.html` is uploaded the same
    way, so only when a new tufops version changes it.

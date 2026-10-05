@@ -366,10 +366,11 @@ fn delegating_config(key: &TestKey, delegations: &[(&str, &[&str])]) -> Result<C
     Config::parse(&delegating_toml(key, delegations))
 }
 
-/// Publishes `repo`, then looks up `paths` with rust-tuf's client, the way TUF clients do.
-async fn client_finds(repo: &Repo, store: &MemStore, paths: &[&str]) -> Vec<bool> {
-    publish::publish(repo, store).await.unwrap();
-    let remote = EphemeralRepository::<Pouf1>::new();
+/// A rust-tuf client. Like other TUF clients, it keeps the metadata it trusts across updates.
+type TestClient = Client<Pouf1, EphemeralRepository<Pouf1>, EphemeralRepository<Pouf1>>;
+
+/// Copies the metadata published to `store` to `remote`, where a client reads it.
+async fn mirror(store: &MemStore, remote: &EphemeralRepository<Pouf1>) {
     let objects = store.0.lock().unwrap().clone();
     for (name, data) in objects {
         let Some(file) = name
@@ -388,18 +389,40 @@ async fn client_finds(repo: &Repo, store: &MemStore, paths: &[&str]) -> Vec<bool
             .await
             .unwrap();
     }
+}
+
+/// A client that trusts `repo`'s first root, reading what is published to `store`.
+async fn new_client(repo: &Repo, store: &MemStore) -> TestClient {
+    let remote = EphemeralRepository::new();
+    mirror(store, &remote).await;
     let root = RawSignedMetadata::new(repo.root_history().unwrap()[0].to_vec());
     let local = EphemeralRepository::new();
-    let mut client = Client::with_trusted_root(ClientConfig::default(), &root, local, remote)
+    Client::with_trusted_root(ClientConfig::default(), &root, local, remote)
         .await
-        .unwrap();
-    client.update().await.unwrap();
+        .unwrap()
+}
+
+/// Updates `client` to what is published to `store`, then looks up `paths`.
+async fn update_and_find(
+    client: &mut TestClient,
+    store: &MemStore,
+    paths: &[&str],
+) -> Result<Vec<bool>> {
+    mirror(store, client.remote_repo()).await;
+    client.update().await?;
     let mut found = vec![];
     for path in paths {
         let path = TargetPath::new(*path).unwrap();
         found.push(client.fetch_target_description(&path).await.is_ok());
     }
-    found
+    Ok(found)
+}
+
+/// Publishes `repo`, then looks up `paths` with a new rust-tuf client, the way TUF clients do.
+async fn client_finds(repo: &Repo, store: &MemStore, paths: &[&str]) -> Vec<bool> {
+    publish::publish(repo, store).await.unwrap();
+    let mut client = new_client(repo, store).await;
+    update_and_find(&mut client, store, paths).await.unwrap()
 }
 
 #[tokio::test]
@@ -628,6 +651,111 @@ async fn nested_delegations() {
         &delegating_toml(&key, &[("alpha", &["b/[ab]"])]),
         "`[` is not supported",
     );
+}
+
+/// Clients reject a snapshot that stops listing a role the snapshot they have lists (TUF §5.5
+/// step 5), so a removed role stays listed until the snapshot key rotates, which makes clients
+/// stop trusting the snapshot they have (§5.3 step 11).
+#[tokio::test]
+async fn removed_roles() {
+    let (key, snapshot_key) = (TestKey::new(), TestKey::new());
+    let now = Utc::now();
+    let store = MemStore::default();
+    let publish = async |repo: &mut Repo, config: &Config| {
+        repo.update_online(config, None, now).unwrap();
+        let roles: Vec<_> = repo.roles().map(str::to_owned).collect();
+        sign_all(repo, &Repo::default(), &roles, &[&key, &snapshot_key]).await;
+        publish::publish(repo, &store).await.map(drop)
+    };
+    let both: [(&str, &[&str]); 2] = [("alpha", &["a/*"]), ("beta", &["b/*"])];
+    let paths = ["a/x", "b/y"];
+
+    let config = delegating_config(&key, &both).unwrap();
+    let mut repo = Repo::default();
+    repo.apply_config(&config, None, &Repo::default(), now)
+        .unwrap();
+    let mut files = vec![];
+    for path in paths {
+        let desc = TargetDescription::from_slice(path.as_bytes(), &[HashAlgorithm::Sha256]);
+        let (path, desc) = (TargetPath::new(path).unwrap(), desc.unwrap());
+        store
+            .put(&target_object(&path, &desc).unwrap(), vec![])
+            .await
+            .unwrap();
+        files.push((path, desc));
+    }
+    repo.add_targets(&config, &repo.clone(), files, now)
+        .unwrap();
+    publish(&mut repo, &config).await.unwrap();
+    let mut client = new_client(&repo, &store).await;
+    let found = update_and_find(&mut client, &store, &paths).await;
+    assert_eq!(found.unwrap(), [true, true]);
+
+    // Removing beta leaves it listed at its last version, so the client takes the new snapshot.
+    let (beta_version, _) = repo.require_header("beta").unwrap();
+    let config = delegating_config(&key, &both[..1]).unwrap();
+    let main = repo.clone();
+    repo.apply_config(&config, None, &main, now).unwrap();
+    publish(&mut repo, &config).await.unwrap();
+    let found = update_and_find(&mut client, &store, &paths).await;
+    assert_eq!(found.unwrap(), [true, true]);
+    assert_eq!(repo.snapshot_version("beta").unwrap(), Some(beta_version));
+
+    // Adding beta back goes on from that version, rather than starting over at 1.
+    let config = delegating_config(&key, &both).unwrap();
+    let main = repo.clone();
+    repo.apply_config(&config, None, &main, now).unwrap();
+    let (version, _) = repo.require_header("beta").unwrap();
+    assert_eq!(version, beta_version.checked_add(1).unwrap());
+    publish(&mut repo, &config).await.unwrap();
+    let found = update_and_find(&mut client, &store, &paths).await;
+    assert_eq!(found.unwrap(), [true, true]);
+
+    // Publishing refuses a snapshot that stops listing a role the published one lists, while
+    // the snapshot key is the same: here, storage's snapshot lists a gamma this one doesn't.
+    let with_gamma = [both[0], both[1], ("gamma", &["c/*"][..])];
+    let other_config = delegating_config(&key, &with_gamma).unwrap();
+    let mut other = Repo::default();
+    other
+        .apply_config(&other_config, None, &Repo::default(), now)
+        .unwrap();
+    other.update_online(&other_config, None, now).unwrap();
+    let roles: Vec<_> = other.roles().map(str::to_owned).collect();
+    sign_all(&mut other, &Repo::default(), &roles, &[&key]).await;
+    let (version, _) = repo.require_header("snapshot").unwrap();
+    let name = format!("metadata/{version}.snapshot.json");
+    let published = store.get(&name).await.unwrap().unwrap();
+    let forged = other.raw("snapshot").unwrap().to_vec();
+    store.put(&name, forged).await.unwrap();
+    let err = format!("{:#}", publish::publish(&repo, &store).await.unwrap_err());
+    assert!(err.contains("lists gamma at version"), "{err}");
+    store.put(&name, published).await.unwrap();
+
+    // Rotating the snapshot key while removing beta drops it from the snapshot.
+    let mut text = format!(
+        "storage = \"gs://bucket\"\n{}{}",
+        key_toml("online", &key),
+        key_toml("snapshot", &snapshot_key)
+    );
+    for role in TOP_LEVEL_ROLES {
+        text += &role_toml(
+            role,
+            if role == "snapshot" {
+                "snapshot"
+            } else {
+                "online"
+            },
+        );
+    }
+    text += &delegation_toml("alpha", "online", &["a/*"]);
+    let config = Config::parse(&text).unwrap();
+    let main = repo.clone();
+    repo.apply_config(&config, None, &main, now).unwrap();
+    publish(&mut repo, &config).await.unwrap();
+    assert_eq!(repo.snapshot_version("beta").unwrap(), None);
+    assert!(repo.snapshot_version("alpha").unwrap().is_some());
+    let found = update_and_find(&mut client, &store, &paths).await;
+    assert_eq!(found.unwrap(), [true, true]);
 }
 
 /// A role signed by an online key that doesn't sign snapshot or timestamp: CI doesn't hold such

@@ -245,19 +245,23 @@ impl Repo {
 
     /// Keys among `keys` with a valid signature on `role`.
     pub fn signed_by(&self, role: &str, keys: &[PublicKey]) -> Result<Vec<PublicKey>> {
-        let (sigs, raw) = Pouf1::deserialize_signed(self.require_raw(role)?)?;
-        let input = Pouf1::signing_input(&raw)?;
+        signed_by(role, self.require_raw(role)?, keys)
+    }
+
+    /// Whether `bytes`, a version of `role`, is signed by a threshold of the keys the role has
+    /// here, so that clients that trust this repository's root trust it too.
+    pub fn trusts(&self, role: &str, bytes: &[u8]) -> Result<bool> {
+        let (threshold, keys) = self.role_keys(role)?;
+        Ok(signed_by(role, bytes, &keys)?.len() as u32 >= threshold.get())
+    }
+
+    /// The version of `role` that the snapshot lists, if any.
+    pub fn snapshot_version(&self, role: &str) -> Result<Option<MetadataVersion>> {
+        let Some(snapshot) = self.metadata::<SnapshotMetadata>("snapshot")? else {
+            return Ok(None);
+        };
         let path = MetadataPath::new(role.to_owned())?;
-        let verifies = |k: &PublicKey, s: &Signature| {
-            k.verify(&path, &input, s)
-                .inspect_err(|err| warn!(role, key = %k.key_id(), "bad signature: {err}"))
-                .is_ok()
-        };
-        let valid = |k: &PublicKey| {
-            sigs.iter()
-                .any(|s| s.key_id() == k.key_id() && verifies(k, s))
-        };
-        Ok(keys.iter().filter(|k| valid(k)).cloned().collect())
+        Ok(snapshot.meta().get(&path).map(|listed| listed.version()))
     }
 
     /// Keys whose signatures `role` still needs to reach its thresholds.
@@ -297,7 +301,8 @@ impl Repo {
     /// * `expires_days` differs from `previous`, the config the current metadata was built from,
     /// * or the version in `base` lacks signatures from the keys the role now has.
     ///
-    /// The new version is one more than the version in `base`. Returns `role` if it changed.
+    /// The new version is one more than the version in `base`, or for a role `base` no longer
+    /// has, than the version its snapshot still lists. Returns `role` if it changed.
     fn update<M: Metadata>(
         &mut self,
         base: &Repo,
@@ -330,8 +335,14 @@ impl Repo {
                 return Ok(None);
             }
         }
-        let version = match base.header(role)? {
-            Some((v, _)) => v.checked_add(1).context("version overflow")?,
+        // A removed role stays listed in the snapshot (see `update_online`), so a new role of the
+        // same name goes on from the version listed there.
+        let last = match base.header(role)? {
+            Some((version, _)) => Some(version),
+            None => base.snapshot_version(role)?,
+        };
+        let version = match last {
+            Some(v) => v.checked_add(1).context("version overflow")?,
             None => MetadataVersion::ONE,
         };
         let expires = now + Duration::days(config.expires_days);
@@ -481,7 +492,17 @@ impl Repo {
             }
         }
 
-        let mut meta = HashMap::new();
+        // Clients reject a snapshot that stops listing a role the snapshot they trust lists, even
+        // one no longer delegated (TUF §5.5 step 5), so roles that were removed stay listed at
+        // their last version. Clients stop trusting their snapshot once a new root no longer
+        // accepts its signatures (§5.3 step 11), so after the snapshot keys rotate, the snapshot
+        // starts over with the current roles.
+        let mut meta = match self.metadata::<SnapshotMetadata>("snapshot")? {
+            Some(cur) if self.trusts("snapshot", self.require_raw("snapshot")?)? => {
+                cur.meta().clone()
+            }
+            _ => HashMap::new(),
+        };
         for role in self.targets_roles() {
             let (version, _) = self.require_header(&role)?;
             meta.insert(
@@ -520,6 +541,23 @@ impl Repo {
 pub fn parse_unverified<M: Metadata>(bytes: &[u8]) -> tuf::Result<M> {
     let raw = RawSignedMetadata::<Pouf1, M>::new(bytes.to_vec());
     raw.parse_untrusted()?.assume_valid()
+}
+
+/// Keys among `keys` with a valid signature on `bytes`, a version of `role`.
+fn signed_by(role: &str, bytes: &[u8], keys: &[PublicKey]) -> Result<Vec<PublicKey>> {
+    let (sigs, raw) = Pouf1::deserialize_signed(bytes)?;
+    let input = Pouf1::signing_input(&raw)?;
+    let path = MetadataPath::new(role.to_owned())?;
+    let verifies = |k: &PublicKey, s: &Signature| {
+        k.verify(&path, &input, s)
+            .inspect_err(|err| warn!(role, key = %k.key_id(), "bad signature: {err}"))
+            .is_ok()
+    };
+    let valid = |k: &PublicKey| {
+        sigs.iter()
+            .any(|s| s.key_id() == k.key_id() && verifies(k, s))
+    };
+    Ok(keys.iter().filter(|k| valid(k)).cloned().collect())
 }
 
 /// Threshold and key ids that `root` gives the top-level `role`.
