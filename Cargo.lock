@@ -3707,7 +3707,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tuf"
 version = "0.3.0-beta15"
-source = "git+https://github.com/rf-signing-experiment/rust-tuf.git?branch=review-stack#bf1957473cf507f780b1d87d067661b5139e1171"
+source = "git+https://github.com/rf-signing-experiment/rust-tuf.git?branch=review-stack#f70f18e50e54fa92b3e9a2036ba16a5a75c3de53"
 dependencies = [
  "chrono",
  "data-encoding",

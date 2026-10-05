@@ -1,17 +1,18 @@
 //! `tufops.toml`: the declarative description of keys and roles.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use tuf::crypto::{KeyId, PublicKey};
-use tuf::metadata::{MetadataPath, TargetPath};
+use tuf::metadata::{MetadataPath, PathPattern};
 
 use crate::backend::public_key_from_pem;
 use crate::git::Git;
+use crate::pattern;
 
 pub const FILE: &str = "tufops.toml";
 
@@ -51,7 +52,8 @@ pub struct RoleConfig {
     pub expires_days: i64,
     /// How long before expiry a new version is signed.
     pub signing_days: i64,
-    /// Target paths delegated to this role; only for roles delegated from `targets`.
+    /// Patterns of the target paths delegated to this role; only for roles delegated from
+    /// `targets`.
     #[serde(default)]
     pub paths: Vec<String>,
 }
@@ -120,43 +122,59 @@ impl Config {
                 "role {name}: `paths` must be set on delegated roles only"
             );
             for path in &role.paths {
-                TargetPath::new(path).with_context(|| format!("role {name}: path"))?;
+                PathPattern::new(path).with_context(|| format!("role {name}: path {path}"))?;
+                ensure!(
+                    !path.ends_with('/'),
+                    "role {name}: path {path} matches no target: paths are patterns that match \
+                     whole target paths, such as {path}* for the targets directly in {path}"
+                );
+                ensure!(
+                    !path.contains('['),
+                    "role {name}: path {path}: `[` is not supported, since clients disagree on \
+                     what it matches"
+                );
             }
         }
         Ok(())
     }
 
-    /// Orders the delegated roles the way clients search them: deepest paths first, so that
-    /// `fw/beta/` comes before `fw/`, then by name. A role's depth is that of its shallowest path.
-    /// Rejected if a role still comes before one with a path its own paths cover, since clients
-    /// would never look for that path's targets in the later role.
+    /// Orders the delegated roles the way clients search them: those with more specific patterns
+    /// first, so that `fw/beta-*` comes before `fw/*`, then by name. A pattern is more specific
+    /// the more characters other than wildcards it has, then the more `?` and the fewer `*` it
+    /// has, and a role is placed by its least specific pattern. Rejected if patterns of two roles
+    /// match some path in common, unless the first role's pattern only matches paths the other's
+    /// matches too: otherwise clients would look for some of the later role's targets in the
+    /// first.
     fn search_order(&self) -> Result<Vec<String>> {
-        let depth = |path: &String| path.split('/').filter(|part| !part.is_empty()).count();
+        let specificity = |path: &String| {
+            let count = |wildcard: char| path.matches(wildcard).count();
+            let (stars, questions) = (count('*'), count('?'));
+            (
+                path.chars().count() - stars - questions,
+                questions,
+                Reverse(stars),
+            )
+        };
         let mut roles: Vec<_> = (self.roles.iter())
             .filter(|(_, role)| !role.paths.is_empty())
             .collect();
-        roles.sort_by_key(|(_, role)| Reverse(role.paths.iter().map(depth).min()));
-        // The first role listing each path, and its position.
-        let mut first = HashMap::new();
-        for (position, (name, role)) in roles.iter().enumerate() {
-            for path in &role.paths {
-                first.entry(path.as_str()).or_insert((position, name));
-            }
-        }
-        for (position, (name, role)) in roles.iter().enumerate() {
-            for path in &role.paths {
-                // The paths covering `path`, the way clients match them: `path`, and each
-                // directory above it.
-                let dirs = path.match_indices('/').map(|(end, _)| &path[..=end]);
-                for covering in dirs.chain([path.as_str()]) {
-                    if let Some((first_position, first_name)) = first.get(covering) {
-                        ensure!(
-                            *first_position >= position,
-                            "roles {first_name} ({covering}) and {name} ({path}) overlap: \
-                             clients would look for {path} in {first_name} only"
-                        );
-                    }
+        roles.sort_by_key(|(_, role)| Reverse(role.paths.iter().map(specificity).min()));
+        // Every path, with the position of its role.
+        let paths: Vec<_> = (roles.iter().enumerate())
+            .flat_map(|(position, (name, role))| {
+                role.paths.iter().map(move |path| (position, name, path))
+            })
+            .collect();
+        for (index, (position, name, path)) in paths.iter().enumerate() {
+            for (later_position, later_name, later_path) in &paths[index + 1..] {
+                if position == later_position || !pattern::overlap(path, later_path) {
+                    continue;
                 }
+                ensure!(
+                    pattern::contains(later_path, path) && !pattern::contains(path, later_path),
+                    "roles {name} ({path}) and {later_name} ({later_path}) overlap, but clients \
+                     search {name} first and {path} is not more specific"
+                );
             }
         }
         Ok(roles.into_iter().map(|(name, _)| name.clone()).collect())

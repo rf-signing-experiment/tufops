@@ -10,8 +10,9 @@ use tracing::{debug, warn};
 use tuf::crypto::{KeyId, PublicKey, Signature, SignatureValue};
 use tuf::metadata::{
     Delegation, Delegations, Metadata, MetadataDescription, MetadataPath, MetadataThreshold,
-    MetadataVersion, RawSignedMetadata, RoleDefinition, RootMetadata, SignedMetadataBuilder,
-    SnapshotMetadata, TargetDescription, TargetPath, TargetsMetadata, TimestampMetadata,
+    MetadataVersion, PathPattern, RawSignedMetadata, RoleDefinition, RootMetadata,
+    SignedMetadataBuilder, SnapshotMetadata, TargetDescription, TargetPath, TargetsMetadata,
+    TimestampMetadata,
 };
 use tuf::pouf::{Pouf, Pouf1};
 
@@ -534,16 +535,17 @@ pub fn root_role_keys<'a>(
     }
 }
 
-/// Whether `pattern` is `path`, or ends in `/` and `path` is under it. Clients use this rule.
+/// Whether `pattern` is `path`, or ends in `/` and `path` is under it.
 pub fn covers(pattern: &TargetPath, path: &TargetPath) -> bool {
-    path == pattern || path.is_child(pattern)
+    let (pattern, path) = (pattern.as_str(), path.as_str());
+    path == pattern || pattern.ends_with('/') && path.starts_with(pattern)
 }
 
-/// The role `path` belongs in under `delegations`: the first whose paths match, the way clients
-/// search them, else `targets`.
+/// The role `path` belongs in under `delegations`: the first whose paths match it, the way
+/// clients search them, else `targets`.
 fn delegated_role(delegations: &Delegations, path: &TargetPath) -> String {
     let mut roles = delegations.roles().iter();
-    let found = roles.find(|d| d.paths().iter().any(|p| covers(p, path)));
+    let found = roles.find(|delegation| delegation.matches_target(path));
     found.map_or("targets", |d| d.name().as_str()).to_owned()
 }
 
@@ -610,7 +612,7 @@ fn config_delegations(config: &Config) -> Result<Delegations> {
         let paths = role
             .paths
             .iter()
-            .map(|p| TargetPath::new(p.clone()))
+            .map(PathPattern::new)
             .collect::<tuf::Result<_>>()?;
         roles.push(Delegation::new(
             MetadataPath::new(name.clone())?,

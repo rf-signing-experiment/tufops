@@ -262,7 +262,7 @@ async fn rm(dir: &Path, paths: &[String], device: Option<u32>) -> Result<()> {
         .map(|p| TargetPath::new(p.clone()).with_context(|| format!("target path {p}")))
         .collect::<Result<_>>()?;
     let mut ev = Event::start(dir, &format!("rm-{}", slug(&paths[0])))?;
-    // A path ending in `/` also matches everything under it, like delegation paths.
+    // A path ending in `/` also matches everything under it.
     let matches = |path: &TargetPath| patterns.iter().any(|p| covers(p, path));
     let (changed, removed) = ev
         .head

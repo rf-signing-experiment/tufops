@@ -32,8 +32,8 @@ Contents:
 
 Every repository has the four top-level TUF roles: `root`, `targets`, `snapshot` and
 `timestamp`. You can add more roles that `targets` **delegates** a set of paths to, for example a
-`firmware` role for `firmware/` signed by YubiKeys and a `nightly` role for `nightly/` signed by
-an online key.
+`firmware` role for the files in `firmware/` signed by YubiKeys and a `nightly` role for those in
+`nightly/` signed by an online key.
 
 A role's keys decide how it is signed:
 
@@ -288,16 +288,16 @@ threshold = 1
 expires_days = 2
 signing_days = 1
 
-# Delegated roles: any role with `paths`.
+# Delegated roles: any role with `paths`, patterns of the target paths it signs.
 [roles.firmware]
-paths = ["firmware/"]
+paths = ["firmware/*"]
 keys = ["alice", "bob"]
 threshold = 2
 expires_days = 365
 signing_days = 60
 
 [roles.nightly]
-paths = ["nightly/"]
+paths = ["nightly/*/*"]                # nightly/<date>/<file>, nightly/latest/<file>
 keys = ["online"]
 threshold = 1
 expires_days = 30
@@ -399,7 +399,8 @@ exist in the source directory are deleted.
 For a role signed only by online keys, CI merges and publishes straight away. For an offline
 role, CI opens a pull request. The signers sign it, then a maintainer merges it.
 
-**Removing files** takes their target paths; a path ending in `/` removes everything under it:
+**Removing files** takes their target paths, not patterns; a path ending in `/` removes
+everything under it:
 
 ```sh
 tufops rm firmware/fw-1.1.bin
@@ -468,14 +469,14 @@ metadata and `tufops.toml`) and pushes like `add`. Typical changes:
 
 * **Add or replace a signer**: add their key under `[keys]` and list it in the roles.
 * **Change a threshold**: edit `threshold`.
-* **New delegated role**: add a `[roles.<name>]` with `paths`. Existing targets under those
-  paths, including ones in the top-level `targets`, move into the new role.
+* **New delegated role**: add a `[roles.<name>]` with `paths`. Existing targets those paths
+  match, including ones in the top-level `targets`, move into the new role.
 * **Change a role's paths, or split, rename or remove a role**: edit `paths`, or replace or
-  delete the role's section. Targets are never dropped: each moves to the role that now covers
-  its path, or to the top-level `targets` if none does, so clients keep finding it. For
-  example, replacing `channels` (`channels/`) with `channels-stable` (`channels/stable/`) and
-  `channels-nightly` (`channels/nightly/`) moves its targets into those two, and anything else
-  under `channels/` into `targets`. The status summarizes moves per pair of roles, as in
+  delete the role's section. Targets are never dropped: each moves to the role whose paths now
+  match it, or to the top-level `targets` if none do, so clients keep finding it. For
+  example, replacing `channels` (`channels/*/*`) with `channels-stable` (`channels/stable/*`)
+  and `channels-nightly` (`channels/nightly/*`) moves its targets into those two, and the rest
+  of them into `targets`. The status summarizes moves per pair of roles, as in
   "3612 targets moved here unchanged from channels". Only targets whose content changes are
   listed individually. The keys of every role gaining or losing targets must sign. To remove
   targets, use `tufops rm` (§4).
@@ -552,22 +553,27 @@ tufops publish    # verify and upload
 | `keys`, `threshold` | Which keys sign the role, and how many signatures it needs. |
 | `expires_days` | How long each new version is valid. Changing it (with `tufops apply`) starts a new version with the new expiry, which must be signed. |
 | `signing_days` | How long before expiry a new version is made. Must be less than `expires_days`. Changing it needs no signatures. |
-| `paths` | Delegated roles only: target paths delegated from `targets`. A path ending in `/` covers everything under it; any other path covers just that file. Paths must not start with `/`. |
+| `paths` | Delegated roles only: patterns of the target paths delegated from `targets`. A pattern matches whole target paths, where `*` matches any characters and `?` any one character, but neither matches `/`: `fw/*` matches `fw/a.bin` but not `fw/beta/a.bin`, which takes `fw/*/*`. Patterns must not start or end with `/`, or contain `[`. |
 
 Delegations are terminating: clients try them in the order `targets` lists them, stopping at
-the first whose paths cover the target. Roles may have paths under other roles' paths, for
-example `archive/` and `archive/2026/`. tufops lists roles with the deepest paths first, then in
-alphabetical order of role name, so each target belongs to the role with the most specific path
-covering it: `archive/2026/a` to the `archive/2026/` role, `archive/2025/a` to the `archive/`
-role. A role with several paths is placed by its shallowest one. Adding or removing a nested
-role moves the targets under it, like any other change to `paths`.
+the first whose paths match the target. Patterns of different roles may overlap if one matches
+only some of the paths the other matches, for example `archive/*/*` and `archive/2026/*`.
+tufops lists roles with more specific patterns first, so each target belongs to the role with
+the most specific pattern matching it: `archive/2026/a` to the `archive/2026/*` role,
+`archive/2025/a` to the `archive/*/*` role. A pattern is more specific the more characters other
+than wildcards it has, then the more `?` and the fewer `*`. A role with several patterns is
+placed by its least specific one, and roles that tie are in alphabetical order. Adding or
+removing a nested role moves the targets it matches, like any other change to `paths`.
 
-`tufops.toml` is rejected if a role's path equals or covers a path of a role listed after it,
-since clients would never look in the later role: two roles with the same path, or a role with
-`a/` and `b/x/` alongside one with `b/` and `a/x/`. `fw/` and `fwx/` don't overlap.
+`tufops.toml` is rejected if patterns of two roles match a path in common and the first role's
+pattern isn't the more specific one, since clients would look for some of the later role's
+targets in the first: the same pattern in two roles, patterns that only partly overlap like
+`fw/*.bin` and `fw/beta-*`, or a role with `a/*/*` and `b/x/*` alongside one with `b/*/*` and
+`a/x/*`. `fw/*` doesn't overlap `fwx/*`, or `fw/*/*`.
 
-Clients must match paths the same way: rust-tuf does. Clients that treat paths as shell-style
-patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everything under it.
+Patterns match as the TUF specification describes, which is how rust-tuf, python-tuf and go-tuf
+match them, except that rust-tuf reads `[` as itself while the others start a character class
+with it. So tufops rejects `[`.
 
 ### CLI
 
@@ -576,7 +582,7 @@ patterns (python-tuf, go-tuf) read `fw/` as a single literal path, not everythin
 | `tufops status` | Show every open signing event and its signatures. |
 | `tufops sign [EVENT…]` | Sign events with your YubiKey. |
 | `tufops add <FROM> <TO> [--delete] [--dry-run]` | Upload new and changed artifacts and add them in a new signing event; `--delete` remove extra files in <TO> |
-| `tufops rm PATH…` | Remove targets (a path ending in `/` removes everything under it) in a new signing event; their uploads are kept. |
+| `tufops rm PATH…` | Remove targets (a path ending in `/` removes everything under it; paths are not patterns) in a new signing event; their uploads are kept. |
 | `tufops apply` | Update metadata to match your `tufops.toml` edits in a new signing event. |
 | `tufops online` | Sign new versions that are due of the roles CI signs, and push them to `main`. |
 | `tufops publish` | Verify the checkout and upload changed metadata. |

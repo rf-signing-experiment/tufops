@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod config;
 pub mod git;
+mod pattern;
 pub mod publish;
 pub mod repo;
 pub mod status;

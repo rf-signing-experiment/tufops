@@ -133,7 +133,7 @@ keys = ["online"]
 threshold = 1
 expires_days = 30
 signing_days = 7
-paths = ["nightly/"]
+paths = ["nightly/*"]
 "#,
         alice.pem(),
         bob.pem(),
@@ -339,14 +339,14 @@ fn role_toml(name: &str, key: &str, extra: &str) -> String {
     )
 }
 
-/// A repository signed by one online key, delegating each `(role, path)`.
-fn delegating_config(key: &TestKey, delegations: &[(&str, &str)]) -> Result<Config> {
+/// A repository signed by one online key, delegating each `(role, paths)`.
+fn delegating_config(key: &TestKey, delegations: &[(&str, &[&str])]) -> Result<Config> {
     let mut text = format!("storage = \"gs://bucket\"\n{}", key_toml("online", key));
     for role in TOP_LEVEL_ROLES {
         text += &role_toml(role, "online", "");
     }
-    for (name, path) in delegations {
-        text += &role_toml(name, "online", &format!("paths = [\"{path}\"]"));
+    for (name, paths) in delegations {
+        text += &role_toml(name, "online", &format!("paths = {paths:?}"));
     }
     Config::parse(&text)
 }
@@ -406,9 +406,11 @@ async fn delegated_paths() {
         role.changes.iter().map(|c| c.to_string()).collect()
     };
     let paths = ["a/x", "b/y", "b/one/p", "b/two/q", "z"];
+    // `*` doesn't match `/`, so beta needs a pattern for each level.
+    let beta: (&str, &[&str]) = ("beta", &["b/*", "b/*/*"]);
 
     // Each target goes in the role its path belongs in, and clients find them all.
-    let config = delegating_config(&key, &[("alpha", "a/"), ("beta", "b/")]).unwrap();
+    let config = delegating_config(&key, &[("alpha", &["a/*"]), beta]).unwrap();
     let mut repo = Repo::default();
     repo.apply_config(&config, None, &Repo::default(), now)
         .unwrap();
@@ -427,8 +429,9 @@ async fn delegated_paths() {
     publish(&mut repo, &config).await;
     assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
 
-    // Moving alpha from a/ to c/ moves a/x to the top-level targets, where clients still find it.
-    let config = delegating_config(&key, &[("alpha", "c/"), ("beta", "b/")]).unwrap();
+    // Moving alpha from a/* to c/* moves a/x to the top-level targets, where clients still find
+    // it.
+    let config = delegating_config(&key, &[("alpha", &["c/*"]), beta]).unwrap();
     let main = repo.clone();
     let changed = repo.apply_config(&config, None, &main, now).unwrap();
     assert_eq!(changed, ["targets", "alpha"]);
@@ -443,8 +446,8 @@ async fn delegated_paths() {
     publish(&mut repo, &config).await;
     assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
 
-    // Delegating a path moves the targets under it out of the top-level targets.
-    let config = delegating_config(&key, &[("alpha", "z"), ("beta", "b/")]).unwrap();
+    // Delegating a path moves the targets it matches out of the top-level targets.
+    let config = delegating_config(&key, &[("alpha", &["z"]), beta]).unwrap();
     let main = repo.clone();
     assert_eq!(
         repo.apply_config(&config, None, &main, now).unwrap(),
@@ -459,11 +462,11 @@ async fn delegated_paths() {
     assert_eq!(client_finds(&repo, &store, &paths).await, [true; 5]);
 
     // Replacing beta with two roles that split its paths moves its targets into them, and what
-    // neither covers into the top-level targets: none are lost.
-    let split = [
-        ("alpha", "z"),
-        ("beta-one", "b/one/"),
-        ("beta-two", "b/two/"),
+    // neither matches into the top-level targets: none are lost.
+    let split: [(&str, &[&str]); 3] = [
+        ("alpha", &["z"]),
+        ("beta-one", &["b/one/*"]),
+        ("beta-two", &["b/two/*"]),
     ];
     let config = delegating_config(&key, &split).unwrap();
     let main = repo.clone();
@@ -512,8 +515,8 @@ async fn delegated_paths() {
     );
 }
 
-/// Roles with paths under other roles' paths: each target goes in the role with the most
-/// specific path covering it, and clients find it there.
+/// Roles with paths matching some of the targets other roles' paths match: each target goes in
+/// the role with the most specific path matching it, and clients find it there.
 #[tokio::test]
 async fn nested_delegations() {
     let key = TestKey::new();
@@ -529,15 +532,18 @@ async fn nested_delegations() {
     };
 
     // By name, archive would come first and hide the roles under it from clients.
-    let nested = [
-        ("archive", "archive/"),
-        ("recent", "archive/2026/"),
-        ("today", "archive/2026/10/"),
-        ("zfile", "archive/2026/notes"),
+    let nested: [(&str, &[&str]); 4] = [
+        ("archive", &["archive/*", "archive/*/*", "archive/*/*/*"]),
+        ("recent", &["archive/2026/*", "archive/2026/*/*"]),
+        ("today", &["archive/2026/10/*"]),
+        ("zfile", &["archive/2026/notes"]),
     ];
+    let order = |delegations: &[(&str, &[&str])]| -> Vec<String> {
+        let config = delegating_config(&key, delegations).unwrap();
+        config.delegations().map(|(name, _)| name.clone()).collect()
+    };
+    assert_eq!(order(&nested), ["zfile", "today", "recent", "archive"]);
     let config = delegating_config(&key, &nested).unwrap();
-    let order: Vec<_> = config.delegations().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(order, ["today", "zfile", "recent", "archive"]);
 
     let mut repo = Repo::default();
     repo.apply_config(&config, None, &Repo::default(), now)
@@ -576,20 +582,43 @@ async fn nested_delegations() {
     expected.sort();
     assert_eq!(listed, expected);
 
-    // Two roles with the same path are rejected; a mere common prefix is fine.
-    let err = delegating_config(&key, &[("alpha", "b/"), ("beta", "b/")]).unwrap_err();
-    assert!(format!("{err:#}").contains("overlap"), "{err:#}");
-    delegating_config(&key, &[("alpha", "bb/"), ("beta", "b/")]).unwrap();
+    // Whatever the names, patterns with more characters other than wildcards come first, then
+    // those with `?` rather than `*`.
+    let all_and_beta: [(&str, &[&str]); 2] = [("all", &["fw/*"]), ("beta", &["fw/*-beta-*"])];
+    assert_eq!(order(&all_and_beta), ["beta", "all"]);
+    let any_and_one: [(&str, &[&str]); 2] = [("any", &["fw/v?.bin"]), ("one", &["fw/v1.bin"])];
+    assert_eq!(order(&any_and_one), ["one", "any"]);
 
-    // So are roles that can't be ordered so each path is searched before the paths covering it.
-    let mut text = format!("storage = \"gs://bucket\"\n{}", key_toml("online", &key));
-    for role in TOP_LEVEL_ROLES {
-        text += &role_toml(role, "online", "");
+    // Two roles' patterns may only match the same path if one matches some of the other's paths
+    // and no others: the same pattern twice, or ones that only partly overlap, are rejected.
+    for (first, second) in [("b/*", "b/*"), ("fw/*.bin", "fw/beta-*"), ("*/x", "b/*")] {
+        let err = delegating_config(&key, &[("alpha", &[first]), ("beta", &[second])]);
+        let err = format!("{:#}", err.unwrap_err());
+        assert!(err.contains("overlap"), "{first} and {second}: {err}");
     }
-    text += &role_toml("alpha", "online", "paths = [\"a/\", \"b/x/\"]");
-    text += &role_toml("beta", "online", "paths = [\"b/\", \"a/x/\"]");
-    let err = Config::parse(&text).unwrap_err();
-    assert!(format!("{err:#}").contains("overlap"), "{err:#}");
+    // So are roles that can't be ordered so that each one's patterns come before the less
+    // specific ones they overlap.
+    let tangled: [(&str, &[&str]); 2] = [
+        ("alpha", &["a/*/*", "b/x/*"]),
+        ("beta", &["b/*/*", "a/x/*"]),
+    ];
+    let err = format!("{:#}", delegating_config(&key, &tangled).unwrap_err());
+    assert!(err.contains("overlap"), "{err}");
+    // Patterns that match no path in common are fine, even with a common prefix, since `*`
+    // doesn't match `/`.
+    for (first, second) in [("bb/*", "b/*"), ("b/*/*", "b/*"), ("*.bin", "*.txt")] {
+        delegating_config(&key, &[("alpha", &[first]), ("beta", &[second])]).unwrap();
+    }
+
+    // Also rejected: paths ending in `/`, which covered everything under them before paths were
+    // patterns, and `[`, which clients disagree on.
+    let err = delegating_config(&key, &[("alpha", &["b/"])]).unwrap_err();
+    assert!(format!("{err:#}").contains("such as b/* for"), "{err:#}");
+    let err = delegating_config(&key, &[("alpha", &["b/[ab]"])]).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("`[` is not supported"),
+        "{err:#}"
+    );
 }
 
 /// A role signed by an online key that doesn't sign snapshot or timestamp: CI doesn't hold such
@@ -605,7 +634,7 @@ async fn online_key_ci_lacks() {
     for role in TOP_LEVEL_ROLES {
         text += &role_toml(role, "ci", "");
     }
-    text += &role_toml("tools", "tools", "paths = [\"tools/\"]");
+    text += &role_toml("tools", "tools", "paths = [\"tools/*\"]");
     let config = Config::parse(&text).unwrap();
     assert!(config.ci_signs("targets") && !config.ci_signs("tools"));
 
